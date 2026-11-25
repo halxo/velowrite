@@ -26,6 +26,7 @@ import { SlashCommandMenu } from './ui/slashMenu';
 import { OutlineSidebar } from './ui/outlineSidebar';
 import { CommandPalette, type PaletteCommand } from './ui/commandPalette';
 import { StatusFooter } from './ui/statusFooter';
+import { UpdateBanner } from './ui/updateBanner';
 import { ICONS } from './ui/icons';
 
 class VeloWriteApp {
@@ -40,6 +41,9 @@ class VeloWriteApp {
   private sidebar!: OutlineSidebar;
   private palette!: CommandPalette;
   private footer!: StatusFooter;
+  private updateBanner?: UpdateBanner;
+  private manualUpdateCheck = false;
+  private desktopVersion: string | null = null;
 
   private topbarEl!: HTMLElement;
   private titleInput!: HTMLInputElement;
@@ -131,6 +135,21 @@ class VeloWriteApp {
     });
 
     this.palette = new CommandPalette(() => this.buildPaletteCommands());
+
+    if (window.velowriteDesktop) {
+      this.updateBanner = new UpdateBanner(() => {
+        void window.velowriteDesktop?.installUpdate();
+      });
+      window.velowriteDesktop.onUpdateStatus((ev) => {
+        this.updateBanner?.showStatus(ev, this.manualUpdateCheck);
+        if (ev.status === 'up-to-date' || ev.status === 'error' || ev.status === 'downloaded') {
+          this.manualUpdateCheck = false;
+        }
+      });
+      void window.velowriteDesktop.getAppInfo().then((info) => {
+        this.desktopVersion = info.version;
+      });
+    }
 
     this.storage.setSaveStateListener((state) => {
       this.saveStatusEl.classList.toggle('is-saving', state === 'saving');
@@ -410,6 +429,24 @@ class VeloWriteApp {
         keywords: ['open', 'upload', 'json'],
         run: () => this.importInput.click(),
       },
+      ...(window.velowriteDesktop
+        ? [
+            {
+              id: 'check-updates',
+              section: 'Actions' as const,
+              label: 'Check for Updates (GitHub)',
+              subtitle: this.desktopVersion
+                ? `Current version v${this.desktopVersion} · Auto-updates from halxo/velowrite`
+                : 'Check GitHub Releases for a newer version of VeloWrite',
+              icon: ICONS.bolt,
+              keywords: ['update', 'upgrade', 'version', 'github', 'release'],
+              run: () => {
+                this.manualUpdateCheck = true;
+                void window.velowriteDesktop?.checkForUpdates();
+              },
+            },
+          ]
+        : []),
 
       // Export
       {
