@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VeloWrite — Ultra-Fast Local-First Document Editor</title>
+    <meta
+      name="description"
+      content="VeloWrite is a local-first, sub-16ms document editor with virtualized 100-page rendering, instant Markdown formatting, IndexedDB autosave, and clean Markdown, DOCX, and JSON export."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="app" class="vw-shell">
+      <header id="vw-topbar" class="vw-topbar">
+        <div class="vw-topbar-left">
+          <button
+            type="button"
+            id="vw-btn-toggle-sidebar"
+            class="vw-icon-btn"
+            title="Toggle Sidebar (⌘\\)"
+            aria-label="Toggle Sidebar"
+          ></button>
+          <span class="vw-brand" aria-label="VeloWrite">VeloWrite</span>
+          <span class="vw-topbar-sep" aria-hidden="true">/</span>
+          <input
+            type="text"
+            id="vw-doc-title"
+            class="vw-doc-title-input"
+            value="Untitled Document"
+            aria-label="Document title"
+            spellcheck="false"
+          />
+          <span id="vw-save-status" class="vw-save-status" title="Stored locally in IndexedDB">
+            <span class="vw-save-dot"></span>
+            <span class="vw-save-label">Saved</span>
+          </span>
+        </div>
+        <div class="vw-topbar-right">
+          <button
+            type="button"
+            id="vw-btn-page-mode"
+            class="vw-pill-btn"
+            title="Switch between Paginated and Continuous view"
+          ></button>
+          <button
+            type="button"
+            id="vw-btn-palette"
+            class="vw-palette-trigger"
+            title="Open Command Palette (⌘K)"
+          >
+            <span class="vw-palette-trigger-text">Commands</span>
+            <kbd>⌘K</kbd>
+          </button>
+        </div>
+      </header>
+
+      <div class="vw-workspace">
+        <aside id="vw-sidebar" class="vw-sidebar" aria-label="Document outline and files"></aside>
+
+        <main id="vw-scroll-container" class="vw-scroll-container">
+          <div class="vw-canvas-stage">
+            <article
+              id="vw-page-surface"
+              class="vw-page-surface"
+              data-page-mode="paginated"
+              data-margins="normal"
+              data-font="serif"
+              aria-label="Document editor"
+            ></article>
+          </div>
+        </main>
+      </div>
+
+      <footer id="vw-footer" class="vw-footer" aria-label="Document statistics"></footer>
+      <input type="file" id="vw-import-json-input" accept=".json,application/json" hidden />
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
