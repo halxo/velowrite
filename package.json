@@ -64,8 +64,8 @@
     "electron-updater": "^6.6.2"
   },
   "devDependencies": {
-    "electron": "^39.2.7",
-    "electron-builder": "^26.0.12",
+    "electron": "^45.5.0",
+    "electron-builder": "^26.18.0",
     "typescript": "~7.0.2",
     "vite": "^8.3.6"
   }
