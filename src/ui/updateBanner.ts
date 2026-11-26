@@ -15,6 +15,7 @@ export interface DesktopAppInfo {
 }
 
 export interface VeloWriteDesktopBridge {
+  notifyRendererReady: () => Promise<boolean>;
   getAppInfo: () => Promise<DesktopAppInfo>;
   checkForUpdates: () => Promise<{ ok: boolean; packaged?: boolean; error?: string }>;
   installUpdate: () => Promise<void>;
@@ -37,6 +38,9 @@ export interface VeloWriteDesktopBridge {
   }) => Promise<boolean>;
   syncReadAll: (payload: { folderPath: string }) => Promise<string[]>;
   onUpdateStatus: (cb: (event: UpdateStatusEvent) => void) => () => void;
+  onExternalFileOpened: (
+    cb: (payload: { filePath: string; fileName: string; content: string }) => void
+  ) => () => void;
 }
 
 declare global {

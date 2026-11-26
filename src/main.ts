@@ -8,6 +8,7 @@ import {
 import { generateId } from './model/sanitize';
 import {
   DEFAULT_PREFERENCES,
+  type DocumentModel,
   type DocumentSnapshot,
   type DocumentSummary,
   type FontPreset,
@@ -21,6 +22,8 @@ import { VeloStorage } from './storage/indexedDB';
 import {
   documentToMarkdown,
   exportToDocx,
+  exportToEpub,
+  exportToHtml,
   exportToJson,
   exportToMarkdown,
   markdownToDocument,
@@ -34,6 +37,9 @@ import { CommandPalette, type PaletteCommand } from './ui/commandPalette';
 import { StatusFooter } from './ui/statusFooter';
 import { FindReplaceBar } from './ui/findReplaceBar';
 import { SnapshotModal } from './ui/snapshotModal';
+import { DocumentTabBar } from './ui/tabBar';
+import { SplitReferencePane } from './ui/splitPane';
+import { ShortcutsModal } from './ui/shortcutsModal';
 import { UpdateBanner } from './ui/updateBanner';
 import { ICONS } from './ui/icons';
 
@@ -42,6 +48,7 @@ class VeloWriteApp {
   private store = new DocumentStore(createWelcomeDocument());
   private prefs: UserPreferences = { ...DEFAULT_PREFERENCES };
   private recentDocs: DocumentSummary[] = [];
+  private secondaryDocCache: DocumentModel | null = null;
 
   private renderer!: VirtualDocumentRenderer;
   private selectionToolbar!: FloatingSelectionToolbar;
@@ -51,6 +58,9 @@ class VeloWriteApp {
   private footer!: StatusFooter;
   private findBar!: FindReplaceBar;
   private snapshotModal!: SnapshotModal;
+  private tabBar!: DocumentTabBar;
+  private splitPane!: SplitReferencePane;
+  private shortcutsModal!: ShortcutsModal;
   private updateBanner?: UpdateBanner;
 
   private manualUpdateCheck = false;
@@ -63,6 +73,7 @@ class VeloWriteApp {
   private saveStatusEl!: HTMLElement;
   private saveLabelEl!: HTMLElement;
   private pageModeBtn!: HTMLButtonElement;
+  private splitBtn!: HTMLButtonElement;
   private importInput!: HTMLInputElement;
   private imageInput!: HTMLInputElement;
   private dimTimer: number | null = null;
@@ -73,6 +84,7 @@ class VeloWriteApp {
     this.saveStatusEl = document.getElementById('vw-save-status') as HTMLElement;
     this.saveLabelEl = this.saveStatusEl.querySelector('.vw-save-label') as HTMLElement;
     this.pageModeBtn = document.getElementById('vw-btn-page-mode') as HTMLButtonElement;
+    this.splitBtn = document.getElementById('vw-btn-split') as HTMLButtonElement;
     this.importInput = document.getElementById('vw-import-json-input') as HTMLInputElement;
     this.imageInput = document.getElementById('vw-pick-image-input') as HTMLInputElement;
 
@@ -95,6 +107,7 @@ class VeloWriteApp {
         this.store.loadDocument(welcome);
         await this.storage.saveDocumentImmediate(welcome);
       }
+      this.ensureDocInTabs(this.store.getDocument().id, false);
       this.recentDocs = await this.storage.listDocumentSummaries();
     } catch {
       this.applyTheme('light', false);
@@ -102,10 +115,14 @@ class VeloWriteApp {
 
     this.initComponents();
     this.bindGlobalEvents(sidebarToggleBtn);
+    await this.refreshSplitPane();
     this.syncChromeFromStore();
 
-    if (this.prefs.syncFolderPath && window.velowriteDesktop) {
-      void this.pullFromSyncFolder();
+    if (window.velowriteDesktop) {
+      void window.velowriteDesktop.notifyRendererReady();
+      if (this.prefs.syncFolderPath) {
+        void this.pullFromSyncFolder();
+      }
     }
   }
 
@@ -114,9 +131,30 @@ class VeloWriteApp {
     const pageSurface = document.getElementById('vw-page-surface') as HTMLElement;
     const sidebarEl = document.getElementById('vw-sidebar') as HTMLElement;
     const footerEl = document.getElementById('vw-footer') as HTMLElement;
+    const tabBarEl = document.getElementById('vw-tab-bar') as HTMLElement;
+    const splitPaneEl = document.getElementById('vw-split-pane') as HTMLElement;
 
     this.footer = new StatusFooter(footerEl, () => this.promptWordGoal());
     this.footer.setWordGoal(this.prefs.dailyWordGoal);
+
+    this.tabBar = new DocumentTabBar(tabBarEl, {
+      onSelectTab: (docId) => void this.openDocument(docId),
+      onCloseTab: (docId) => void this.closeTab(docId),
+      onNewTab: () => void this.createNewDocument(),
+    });
+
+    this.splitPane = new SplitReferencePane(splitPaneEl, {
+      onSelectSecondaryDoc: (docId) => {
+        this.prefs.splitSecondaryDocId = docId;
+        void this.storage.savePreferences(this.prefs);
+        void this.refreshSplitPane();
+      },
+      onClose: () => this.toggleSplitPane(false),
+    });
+    this.splitPane.setOpen(this.prefs.splitPaneOpen);
+    this.splitBtn.classList.toggle('is-active', this.prefs.splitPaneOpen);
+
+    this.shortcutsModal = new ShortcutsModal();
 
     this.sidebar = new OutlineSidebar(sidebarEl, {
       onSelectHeading: (blockIndex) => {
@@ -196,6 +234,10 @@ class VeloWriteApp {
           this.manualUpdateCheck = false;
         }
       });
+      window.velowriteDesktop.onExternalFileOpened((payload) => {
+        this.currentDiskFilePath = payload.filePath;
+        void this.loadImportedText(payload.fileName, payload.content);
+      });
       void window.velowriteDesktop.getAppInfo().then((info) => {
         this.desktopVersion = info.version;
       });
@@ -244,6 +286,10 @@ class VeloWriteApp {
         this.updatePageModeButton();
       }
 
+      if (this.prefs.splitPaneOpen && this.prefs.splitSecondaryDocId === null) {
+        this.splitPane.render(this.store.getDocument(), this.recentDocs, null);
+      }
+
       if (ev.kind !== 'load') {
         this.storage.scheduleAutosave(this.store.getDocument());
       }
@@ -253,10 +299,15 @@ class VeloWriteApp {
   private bindGlobalEvents(sidebarToggleBtn: HTMLButtonElement): void {
     sidebarToggleBtn.addEventListener('click', () => this.toggleSidebar());
     this.pageModeBtn.addEventListener('click', () => this.togglePageMode());
+    this.splitBtn.addEventListener('click', () => this.toggleSplitPane());
 
     document
       .getElementById('vw-btn-palette')
       ?.addEventListener('click', () => this.palette.open());
+
+    document
+      .getElementById('vw-btn-shortcuts')
+      ?.addEventListener('click', () => this.shortcutsModal.open());
 
     this.titleInput.addEventListener('input', () => {
       this.store.setTitle(this.titleInput.value);
@@ -293,9 +344,18 @@ class VeloWriteApp {
       if (mod && key === 'k') {
         e.preventDefault();
         this.palette.toggle();
+      } else if (mod && e.altKey && e.key === '\\') {
+        e.preventDefault();
+        this.toggleSplitPane();
       } else if (mod && e.key === '\\') {
         e.preventDefault();
         this.toggleSidebar();
+      } else if (mod && e.key === '/') {
+        e.preventDefault();
+        this.shortcutsModal.toggle();
+      } else if (e.ctrlKey && e.key === 'Tab') {
+        e.preventDefault();
+        this.cycleOpenTabs(e.shiftKey ? -1 : 1);
       } else if (mod && key === 'f') {
         e.preventDefault();
         this.findBar.open(false);
@@ -326,14 +386,74 @@ class VeloWriteApp {
     });
   }
 
+  private ensureDocInTabs(docId: string, persist = true): void {
+    if (!Array.isArray(this.prefs.openTabIds)) {
+      this.prefs.openTabIds = [];
+    }
+    if (!this.prefs.openTabIds.includes(docId)) {
+      this.prefs.openTabIds.push(docId);
+      if (this.prefs.openTabIds.length > 10) {
+        this.prefs.openTabIds.shift();
+      }
+      if (persist) {
+        void this.storage.savePreferences(this.prefs);
+      }
+    }
+  }
+
+  private async closeTab(docId: string): Promise<void> {
+    this.prefs.openTabIds = (this.prefs.openTabIds ?? []).filter((id) => id !== docId);
+    if (docId === this.store.getDocument().id && this.prefs.openTabIds.length > 0) {
+      await this.openDocument(this.prefs.openTabIds[this.prefs.openTabIds.length - 1]);
+    } else if (this.prefs.openTabIds.length === 0) {
+      this.prefs.openTabIds = [this.store.getDocument().id];
+    }
+    await this.storage.savePreferences(this.prefs);
+    this.syncChromeFromStore();
+  }
+
+  private cycleOpenTabs(direction: 1 | -1): void {
+    const tabs = this.prefs.openTabIds ?? [];
+    if (tabs.length <= 1) return;
+    const currentIdx = tabs.indexOf(this.store.getDocument().id);
+    const nextIdx = (currentIdx + direction + tabs.length) % tabs.length;
+    void this.openDocument(tabs[nextIdx]);
+  }
+
+  private toggleSplitPane(force?: boolean): void {
+    const next = force !== undefined ? force : !this.prefs.splitPaneOpen;
+    this.prefs.splitPaneOpen = next;
+    this.splitPane.setOpen(next);
+    this.splitBtn.classList.toggle('is-active', next);
+    void this.storage.savePreferences(this.prefs);
+    void this.refreshSplitPane();
+  }
+
+  private async refreshSplitPane(): Promise<void> {
+    if (!this.prefs.splitPaneOpen) return;
+    const secId = this.prefs.splitSecondaryDocId;
+    if (secId) {
+      this.secondaryDocCache = await this.storage.getDocument(secId);
+      if (this.secondaryDocCache) {
+        this.splitPane.render(this.secondaryDocCache, this.recentDocs, secId);
+        return;
+      }
+      this.prefs.splitSecondaryDocId = null;
+    }
+    this.splitPane.render(this.store.getDocument(), this.recentDocs, null);
+  }
+
   private async loadImportedText(fileName: string, content: string): Promise<void> {
-    const doc = fileName.toLowerCase().endsWith('.json')
-      ? parseImportedJson(content)
-      : markdownToDocument(content, fileName);
+    const lower = fileName.toLowerCase();
+    const doc =
+      lower.endsWith('.json') || lower.endsWith('.velowrite')
+        ? parseImportedJson(content)
+        : markdownToDocument(content, fileName);
     if (!doc) return;
     await this.storage.flushPendingSave();
     this.store.loadDocument(doc);
     await this.storage.saveDocumentImmediate(doc);
+    this.ensureDocInTabs(doc.id, false);
     await this.saveLastDocPref(doc.id);
     await this.refreshRecentDocs();
     this.syncChromeFromStore();
@@ -486,6 +606,8 @@ class VeloWriteApp {
     this.footer.updateStats(this.store.getStats());
     this.sidebar.renderOutline(this.store.getOutline());
     this.sidebar.renderDocuments(this.recentDocs, doc.id);
+    this.tabBar.render(this.prefs.openTabIds ?? [doc.id], this.recentDocs, doc.id);
+    void this.refreshSplitPane();
   }
 
   private updatePageModeButton(): void {
@@ -554,7 +676,9 @@ class VeloWriteApp {
 
   private async refreshRecentDocs(): Promise<void> {
     this.recentDocs = await this.storage.listDocumentSummaries();
-    this.sidebar.renderDocuments(this.recentDocs, this.store.getDocument().id);
+    const activeId = this.store.getDocument().id;
+    this.sidebar.renderDocuments(this.recentDocs, activeId);
+    this.tabBar.render(this.prefs.openTabIds ?? [activeId], this.recentDocs, activeId);
   }
 
   private async createNewDocument(): Promise<void> {
@@ -563,6 +687,7 @@ class VeloWriteApp {
     const doc = createBlankDocument('Untitled Document');
     this.store.loadDocument(doc);
     await this.storage.saveDocumentImmediate(doc);
+    this.ensureDocInTabs(doc.id, false);
     await this.saveLastDocPref(doc.id);
     await this.refreshRecentDocs();
     this.syncChromeFromStore();
@@ -577,12 +702,14 @@ class VeloWriteApp {
     const doc = await this.storage.getDocument(docId);
     if (!doc) return;
     this.store.loadDocument(doc);
+    this.ensureDocInTabs(doc.id, false);
     await this.saveLastDocPref(doc.id);
     this.syncChromeFromStore();
   }
 
   private async deleteDocument(docId: string): Promise<void> {
     await this.storage.deleteDocument(docId);
+    this.prefs.openTabIds = (this.prefs.openTabIds ?? []).filter((id) => id !== docId);
     const remaining = await this.storage.listDocumentSummaries();
     if (remaining.length === 0) {
       await this.createNewDocument();
@@ -592,6 +719,7 @@ class VeloWriteApp {
       const next = await this.storage.getDocument(remaining[0].id);
       if (next) {
         this.store.loadDocument(next);
+        this.ensureDocInTabs(next.id, false);
         await this.saveLastDocPref(next.id);
       }
     }
@@ -605,6 +733,7 @@ class VeloWriteApp {
     const bench = generateBenchmarkDocument();
     this.store.loadDocument(bench);
     await this.storage.saveDocumentImmediate(bench);
+    this.ensureDocInTabs(bench.id, false);
     await this.saveLastDocPref(bench.id);
     await this.refreshRecentDocs();
     this.syncChromeFromStore();
@@ -618,16 +747,16 @@ class VeloWriteApp {
         id: 'new-doc',
         section: 'Actions',
         label: 'New Blank Document',
-        subtitle: 'Create a fresh local-first document in IndexedDB',
+        subtitle: 'Create a fresh local-first document tab in IndexedDB',
         icon: ICONS.plus,
-        keywords: ['create', 'file', 'blank'],
+        keywords: ['create', 'file', 'blank', 'tab'],
         run: () => void this.createNewDocument(),
       },
       {
         id: 'open-disk',
         section: 'Actions',
-        label: 'Open File from Disk (.md, .txt, .json)',
-        subtitle: 'Load a local Markdown or JSON file directly into VeloWrite',
+        label: 'Open File from Disk (.md, .velowrite, .json)',
+        subtitle: 'Load a local Markdown or VeloWrite file directly into a tab',
         shortcut: '⌘O',
         icon: ICONS.folder,
         keywords: ['open', 'import', 'disk', 'markdown'],
@@ -638,8 +767,8 @@ class VeloWriteApp {
         section: 'Actions',
         label: 'Save File to Disk',
         subtitle: this.currentDiskFilePath
-          ? `Save to ${this.currentDiskFilePath}`
-          : 'Save document to disk as Markdown or JSON',
+          ? `Save atomically to ${this.currentDiskFilePath}`
+          : 'Save document to disk as Markdown or VeloWrite JSON',
         shortcut: '⌘S',
         icon: ICONS.download,
         keywords: ['save', 'disk', 'file'],
@@ -656,6 +785,18 @@ class VeloWriteApp {
         run: () => this.findBar.open(true),
       },
       {
+        id: 'split-pane',
+        section: 'Actions',
+        label: this.prefs.splitPaneOpen
+          ? 'Close Split Reference Pane'
+          : 'Open Split Reference Pane',
+        subtitle: 'Read a second document or live formatted preview side by side',
+        shortcut: '⌘⌥\\',
+        icon: ICONS.sidebar,
+        keywords: ['split', 'side by side', 'reference', 'preview'],
+        run: () => this.toggleSplitPane(),
+      },
+      {
         id: 'snapshots',
         section: 'Actions',
         label: 'Version Snapshots & Visual Diff',
@@ -663,6 +804,16 @@ class VeloWriteApp {
         icon: ICONS.history,
         keywords: ['history', 'snapshot', 'version', 'diff', 'restore'],
         run: () => void this.openSnapshotModal(),
+      },
+      {
+        id: 'shortcuts-guide',
+        section: 'Actions',
+        label: 'Keyboard Shortcuts & Markdown Guide',
+        subtitle: 'View all keyboard shortcuts and instant Markdown block triggers',
+        shortcut: '⌘/',
+        icon: ICONS.callout,
+        keywords: ['help', 'shortcuts', 'keys', 'guide'],
+        run: () => this.shortcutsModal.open(),
       },
       {
         id: 'toggle-sidebar',
@@ -769,7 +920,7 @@ class VeloWriteApp {
         id: 'export-md',
         section: 'Export',
         label: 'Export as Markdown (.md)',
-        subtitle: 'Clean CommonMark with headings, checklists, tables, and code blocks',
+        subtitle: 'Clean CommonMark with headings, checklists, math, tables, and code blocks',
         icon: ICONS.download,
         keywords: ['markdown', 'md', 'download', 'save'],
         run: () => exportToMarkdown(this.store.getDocument()),
@@ -782,6 +933,24 @@ class VeloWriteApp {
         icon: ICONS.download,
         keywords: ['docx', 'word', 'google docs', 'download'],
         run: () => exportToDocx(this.store.getDocument()),
+      },
+      {
+        id: 'export-epub',
+        section: 'Export',
+        label: 'Export as eBook (.epub)',
+        subtitle: 'Standards-compliant EPUB 3.0 for Apple Books, Kindle, and Kobo',
+        icon: ICONS.download,
+        keywords: ['epub', 'ebook', 'book', 'kindle'],
+        run: () => exportToEpub(this.store.getDocument()),
+      },
+      {
+        id: 'export-html',
+        section: 'Export',
+        label: 'Export as Standalone Web Page (.html)',
+        subtitle: 'Self-contained typographic HTML file with embedded editorial styles',
+        icon: ICONS.download,
+        keywords: ['html', 'web', 'page'],
+        run: () => exportToHtml(this.store.getDocument()),
       },
       {
         id: 'export-json',

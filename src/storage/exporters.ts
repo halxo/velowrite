@@ -1,6 +1,7 @@
 import type { Block, DocumentModel } from '../model/types';
 import { createBlock } from '../model/documentStore';
 import { escapeHtml, generateId } from '../model/sanitize';
+import { renderLatexEquationHtml } from '../editor/mathRenderer';
 
 function sanitizeFilename(title: string, ext: string): string {
   const clean = (title || 'velowrite-document')
@@ -109,6 +110,23 @@ export function markdownToDocument(raw: string, filenameTitle = 'Imported Markdo
 
     if (inCode) {
       codeLines.push(line);
+      continue;
+    }
+
+    if (line.trim().startsWith('$$') && line.trim().endsWith('$$') && line.trim().length > 4) {
+      const expr = line.trim().slice(2, -2).trim();
+      blocks.push(createBlock('math', expr));
+      continue;
+    }
+
+    if (line.trim() === '$$') {
+      const mathLines: string[] = [];
+      i++;
+      while (i < lines.length && lines[i].trim() !== '$$') {
+        mathLines.push(lines[i]);
+        i++;
+      }
+      blocks.push(createBlock('math', mathLines.join(' ').trim()));
       continue;
     }
 
@@ -301,6 +319,9 @@ export function documentToMarkdown(doc: DocumentModel): string {
         break;
       case 'toggle':
         lines.push(`<details><summary>${inlineHtmlToMarkdown(b.html)}</summary>\n\n${b.toggleBody ?? ''}\n\n</details>`, '');
+        break;
+      case 'math':
+        lines.push('$$', b.text, '$$', '');
         break;
       case 'code-block':
         lines.push(`\`\`\`${b.codeLang ?? ''}`, b.text, '```', '');
@@ -649,7 +670,10 @@ function crc32(bytes: Uint8Array): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-function buildZipBlob(files: Array<{ name: string; content: string }>): Blob {
+function buildZipBlob(
+  files: Array<{ name: string; content: string; asciiHeader?: boolean }>,
+  mimeType: string
+): Blob {
   const encoder = new TextEncoder();
   const localChunks: Uint8Array[] = [];
   const centralChunks: Uint8Array[] = [];
@@ -659,12 +683,13 @@ function buildZipBlob(files: Array<{ name: string; content: string }>): Blob {
     const nameBytes = encoder.encode(file.name);
     const dataBytes = encoder.encode(file.content);
     const checksum = crc32(dataBytes);
+    const gpFlag = file.asciiHeader ? 0x0000 : 0x0800;
 
     const localHeader = new Uint8Array(30 + nameBytes.length);
     const lv = new DataView(localHeader.buffer);
     lv.setUint32(0, 0x04034b50, true);
     lv.setUint16(4, 20, true);
-    lv.setUint16(6, 0x0800, true);
+    lv.setUint16(6, gpFlag, true);
     lv.setUint16(8, 0, true);
     lv.setUint16(10, 0, true);
     lv.setUint16(12, 0, true);
@@ -682,7 +707,7 @@ function buildZipBlob(files: Array<{ name: string; content: string }>): Blob {
     cv.setUint32(0, 0x02014b50, true);
     cv.setUint16(4, 20, true);
     cv.setUint16(6, 20, true);
-    cv.setUint16(8, 0x0800, true);
+    cv.setUint16(8, gpFlag, true);
     cv.setUint16(10, 0, true);
     cv.setUint16(12, 0, true);
     cv.setUint16(14, 0, true);
@@ -717,18 +742,208 @@ function buildZipBlob(files: Array<{ name: string; content: string }>): Blob {
   ev.setUint16(20, 0, true);
 
   return new Blob([...localChunks, ...centralChunks, eocd] as BlobPart[], {
-    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    type: mimeType,
   });
 }
 
-export function exportToDocx(doc: DocumentModel): void {
+export function buildDocxBlob(doc: DocumentModel): Blob {
   const { documentXml, relsXml } = buildDocxXml(doc);
-  const blob = buildZipBlob([
-    { name: '[Content_Types].xml', content: DOCX_CONTENT_TYPES_XML },
-    { name: '_rels/.rels', content: DOCX_ROOT_RELS_XML },
-    { name: 'word/document.xml', content: documentXml },
-    { name: 'word/styles.xml', content: DOCX_STYLES_XML },
-    { name: 'word/_rels/document.xml.rels', content: relsXml },
-  ]);
-  triggerDownload(blob, sanitizeFilename(doc.title, 'docx'));
+  return buildZipBlob(
+    [
+      { name: '[Content_Types].xml', content: DOCX_CONTENT_TYPES_XML },
+      { name: '_rels/.rels', content: DOCX_ROOT_RELS_XML },
+      { name: 'word/document.xml', content: documentXml },
+      { name: 'word/styles.xml', content: DOCX_STYLES_XML },
+      { name: 'word/_rels/document.xml.rels', content: relsXml },
+    ],
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  );
 }
+
+export function exportToDocx(doc: DocumentModel): void {
+  triggerDownload(buildDocxBlob(doc), sanitizeFilename(doc.title, 'docx'));
+}
+
+/* ==================== STANDALONE HTML EXPORT ==================== */
+
+function renderBlocksBodyHtml(doc: DocumentModel, xhtmlStrict = false): string {
+  const out: string[] = [];
+  for (const b of doc.blocks) {
+    const alignAttr = b.align && b.align !== 'left' ? ` style="text-align:${b.align}"` : '';
+    const content = xhtmlStrict ? escapeXml(b.text) : b.html;
+    switch (b.type) {
+      case 'heading1':
+        out.push(`<h1${alignAttr}>${content}</h1>`);
+        break;
+      case 'heading2':
+        out.push(`<h2${alignAttr}>${content}</h2>`);
+        break;
+      case 'heading3':
+        out.push(`<h3${alignAttr}>${content}</h3>`);
+        break;
+      case 'bullet-list':
+        out.push(`<p class="li"${alignAttr}>• ${content}</p>`);
+        break;
+      case 'numbered-list':
+        out.push(`<p class="li"${alignAttr}>1. ${content}</p>`);
+        break;
+      case 'todo':
+        out.push(`<p class="li">${b.checked ? '☑' : '☐'} ${content}</p>`);
+        break;
+      case 'blockquote':
+      case 'callout':
+        out.push(`<blockquote>${content}</blockquote>`);
+        break;
+      case 'math':
+        out.push(
+          xhtmlStrict
+            ? `<p class="math">${escapeXml(b.text)}</p>`
+            : `<div class="math">${renderLatexEquationHtml(b.text)}</div>`
+        );
+        break;
+      case 'code-block':
+        out.push(`<pre><code>${escapeXml(b.text)}</code></pre>`);
+        break;
+      case 'divider':
+        out.push(xhtmlStrict ? '<hr />' : '<hr>');
+        break;
+      case 'table':
+        if (b.tableData && b.tableData.length > 0) {
+          const rows = b.tableData
+            .map(
+              (r, rIdx) =>
+                `<tr>${r
+                  .map((c) =>
+                    rIdx === 0
+                      ? `<th>${escapeXml(c)}</th>`
+                      : `<td>${escapeXml(c)}</td>`
+                  )
+                  .join('')}</tr>`
+            )
+            .join('');
+          out.push(`<table>${rows}</table>`);
+        }
+        break;
+      default:
+        out.push(`<p${alignAttr}>${content}</p>`);
+        break;
+    }
+  }
+  return out.join('\n    ');
+}
+
+export function documentToStandaloneHtml(doc: DocumentModel): string {
+  const title = escapeHtml(doc.title || 'Untitled Document');
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${title}</title>
+  <style>
+    body { max-width: 720px; margin: 56px auto; padding: 0 24px; font-family: Georgia, 'Newsreader', serif; font-size: 18px; line-height: 1.74; color: #191918; background: #fcfbf9; }
+    h1, h2, h3 { line-height: 1.28; letter-spacing: -0.02em; margin-top: 1.6em; }
+    blockquote { margin: 1.2em 0; padding-left: 18px; border-left: 3px solid #c7c2b8; color: #57534e; font-style: italic; }
+    pre { background: #f3f2ee; border: 1px solid #e4e2dc; border-radius: 6px; padding: 14px 18px; overflow-x: auto; font-size: 14px; line-height: 1.6; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; }
+    table { width: 100%; border-collapse: collapse; margin: 1.2em 0; font-family: system-ui, sans-serif; font-size: 14.5px; }
+    th, td { border: 1px solid #d6d3cd; padding: 8px 10px; text-align: left; }
+    th { background: #f3f2ee; }
+    hr { border: none; border-top: 1px solid #d6d3cd; margin: 2em 0; }
+    .math { text-align: center; font-style: italic; padding: 12px 0; font-size: 1.12em; }
+    .vw-math-frac { display: inline-flex; flex-direction: column; vertical-align: middle; text-align: center; padding: 0 3px; }
+    .vw-math-num { border-bottom: 1px solid currentColor; padding: 0 3px; }
+    .li { margin: 0.25em 0 0.25em 1em; }
+  </style>
+</head>
+<body>
+  <article>
+    ${renderBlocksBodyHtml(doc, false)}
+  </article>
+</body>
+</html>`;
+}
+
+export function exportToHtml(doc: DocumentModel): void {
+  const html = documentToStandaloneHtml(doc);
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+  triggerDownload(blob, sanitizeFilename(doc.title, 'html'));
+}
+
+/* ==================== EPUB 3.0 EBOOK EXPORT ==================== */
+
+export function buildEpubBlob(doc: DocumentModel): Blob {
+  const title = escapeXml(doc.title || 'Untitled Document');
+  const bookId = `urn:uuid:${escapeXml(doc.id || generateId())}`;
+  const modified = new Date(doc.updatedAt || Date.now()).toISOString().replace(/\.\d+Z$/, 'Z');
+
+  const containerXml = `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`;
+
+  const contentOpf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">${bookId}</dc:identifier>
+    <dc:title>${title}</dc:title>
+    <dc:language>en</dc:language>
+    <meta property="dcterms:modified">${modified}</meta>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="chapter1" href="document.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="chapter1"/>
+  </spine>
+</package>`;
+
+  const navXhtml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>${title}</title></head>
+<body>
+  <nav epub:type="toc" id="toc">
+    <h1>Contents</h1>
+    <ol><li><a href="document.xhtml">${title}</a></li></ol>
+  </nav>
+</body>
+</html>`;
+
+  const chapterXhtml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <title>${title}</title>
+  <style>
+    body { font-family: Georgia, serif; line-height: 1.68; margin: 1.2em; }
+    blockquote { border-left: 2px solid #999; padding-left: 12px; font-style: italic; }
+    pre { background: #f4f4f4; padding: 10px; font-family: monospace; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 6px; }
+  </style>
+</head>
+<body>
+  ${renderBlocksBodyHtml(doc, true)}
+</body>
+</html>`;
+
+  return buildZipBlob(
+    [
+      { name: 'mimetype', content: 'application/epub+zip', asciiHeader: true },
+      { name: 'META-INF/container.xml', content: containerXml },
+      { name: 'OEBPS/content.opf', content: contentOpf },
+      { name: 'OEBPS/nav.xhtml', content: navXhtml },
+      { name: 'OEBPS/document.xhtml', content: chapterXhtml },
+    ],
+    'application/epub+zip'
+  );
+}
+
+export function exportToEpub(doc: DocumentModel): void {
+  triggerDownload(buildEpubBlob(doc), sanitizeFilename(doc.title, 'epub'));
+}
+

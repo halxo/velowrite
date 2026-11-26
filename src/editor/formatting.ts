@@ -175,6 +175,9 @@ export function detectMarkdownBlockTrigger(
   if (normalized === '```' || normalized === '``` ') {
     return { newType: 'code-block', remainderText: '' };
   }
+  if (normalized === '$$' || normalized === '$$ ') {
+    return { newType: 'math', remainderText: '' };
+  }
   if (normalized === '---' || normalized === '--- ') {
     return { newType: 'divider', remainderText: '' };
   }

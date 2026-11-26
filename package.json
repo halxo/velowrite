@@ -1,9 +1,13 @@
 {
   "name": "velowrite",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Ultra-fast, local-first document editor engineered for sub-16ms input latency and 100-page virtualized rendering.",
-  "author": "halxo",
+  "homepage": "https://github.com/halxo/velowrite",
+  "author": {
+    "name": "halxo",
+    "email": "halxo@users.noreply.github.com"
+  },
   "type": "module",
   "main": "electron/main.cjs",
   "repository": {
@@ -12,6 +16,7 @@
   },
   "scripts": {
     "dev": "vite",
+    "test": "vitest run",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "electron:start": "electron .",
@@ -30,6 +35,18 @@
       "electron/**/*",
       "package.json"
     ],
+    "fileAssociations": [
+      {
+        "ext": "velowrite",
+        "name": "VeloWrite Document",
+        "role": "Editor"
+      },
+      {
+        "ext": "md",
+        "name": "Markdown Document",
+        "role": "Editor"
+      }
+    ],
     "win": {
       "target": [
         {
@@ -44,12 +61,19 @@
     },
     "mac": {
       "category": "public.app-category.productivity",
-      "target": ["dmg", "zip"],
+      "target": [
+        "dmg",
+        "zip"
+      ],
       "icon": "build/icon.png"
     },
     "linux": {
       "category": "Office",
-      "target": ["AppImage", "deb"],
+      "maintainer": "halxo <halxo@users.noreply.github.com>",
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "icon": "build/icon.png"
     },
     "nsis": {
@@ -76,7 +100,9 @@
   "devDependencies": {
     "electron": "^45.5.0",
     "electron-builder": "^26.18.0",
+    "jsdom": "^27.0.0",
     "typescript": "~7.0.2",
-    "vite": "^8.3.6"
+    "vite": "^8.3.6",
+    "vitest": "^4.0.0"
   }
 }

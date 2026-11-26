@@ -109,6 +109,14 @@ const SLASH_ITEMS: SlashCommandItem[] = [
     keywords: ['image', 'photo', 'picture', 'media'],
   },
   {
+    type: 'math',
+    label: 'Math Equation',
+    description: 'Display LaTeX formula (e.g. \\frac, \\sum, \\alpha)',
+    shortcut: '$$',
+    icon: `<span class="vw-slash-glyph">∑</span>`,
+    keywords: ['math', 'latex', 'equation', 'formula', 'katex'],
+  },
+  {
     type: 'code-block',
     label: 'Code Block',
     description: 'Syntax-highlighted monospace snippet',

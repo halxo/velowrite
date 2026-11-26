@@ -9,6 +9,7 @@ export type BlockType =
   | 'blockquote'
   | 'callout'
   | 'toggle'
+  | 'math'
   | 'code-block'
   | 'image'
   | 'table'
@@ -95,6 +96,9 @@ export interface UserPreferences {
   theme: ThemeMode;
   sidebarOpen: boolean;
   lastDocumentId: string | null;
+  openTabIds: string[];
+  splitPaneOpen: boolean;
+  splitSecondaryDocId: string | null;
   focusMode: boolean;
   typewriterMode: boolean;
   dailyWordGoal: number;
@@ -119,6 +123,9 @@ export const DEFAULT_PREFERENCES: UserPreferences = {
   theme: 'light',
   sidebarOpen: true,
   lastDocumentId: null,
+  openTabIds: [],
+  splitPaneOpen: false,
+  splitSecondaryDocId: null,
   focusMode: false,
   typewriterMode: false,
   dailyWordGoal: 0,

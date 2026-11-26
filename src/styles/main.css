@@ -2052,3 +2052,351 @@ html[data-theme='dark'] ::highlight(vw-code-number) {
     max-width: 100% !important;
   }
 }
+
+/* ============================ DOCUMENT TAB BAR ============================ */
+
+.vw-tab-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 34px;
+  padding: 0 12px;
+  background: var(--vw-bg-sidebar);
+  border-bottom: 1px solid var(--vw-border);
+  overflow-x: auto;
+  scrollbar-width: none;
+  z-index: 18;
+}
+
+.vw-tab-bar[hidden] {
+  display: none;
+}
+
+.vw-tab-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.vw-tab {
+  display: inline-flex;
+  align-items: center;
+  max-width: 210px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  transition: background 110ms ease, border-color 110ms ease;
+}
+
+.vw-tab:hover {
+  background: var(--vw-bg-hover);
+}
+
+.vw-tab.is-active {
+  background: var(--vw-bg-elevated);
+  border-color: var(--vw-border-strong);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.vw-tab-btn {
+  border: none;
+  background: transparent;
+  color: var(--vw-ink-secondary);
+  font-family: var(--vw-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 0 6px 0 9px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.vw-tab.is-active .vw-tab-btn {
+  color: var(--vw-ink-primary);
+}
+
+.vw-tab-title {
+  display: block;
+  max-width: 155px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vw-tab-close {
+  border: none;
+  background: transparent;
+  color: var(--vw-ink-muted);
+  font-size: 13px;
+  line-height: 1;
+  width: 20px;
+  height: 20px;
+  margin-right: 3px;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.vw-tab-close:hover {
+  opacity: 1;
+  background: var(--vw-bg-subtle);
+  color: var(--vw-ink-primary);
+}
+
+.vw-tab-new {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--vw-ink-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.vw-tab-new:hover {
+  background: var(--vw-bg-hover);
+  color: var(--vw-ink-primary);
+}
+
+.vw-pill-btn.is-active {
+  background: var(--vw-accent-soft);
+  color: var(--vw-accent);
+  border-color: var(--vw-accent);
+}
+
+/* ============================ SPLIT REFERENCE PANE ============================ */
+
+.vw-split-pane {
+  width: 42%;
+  max-width: 600px;
+  min-width: 300px;
+  display: flex;
+  flex-direction: column;
+  background: var(--vw-bg-sidebar);
+  border-left: 1px solid var(--vw-border);
+  overflow: hidden;
+}
+
+.vw-split-pane[hidden] {
+  display: none;
+}
+
+.vw-split-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--vw-border);
+}
+
+.vw-split-badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--vw-ink-muted);
+  flex-shrink: 0;
+}
+
+.vw-split-select {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  border: 1px solid var(--vw-border);
+  border-radius: 5px;
+  background: var(--vw-bg-elevated);
+  color: var(--vw-ink-primary);
+  font-family: var(--vw-font-ui);
+  font-size: 12px;
+  padding: 0 6px;
+  outline: none;
+}
+
+.vw-split-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 28px 32px 64px;
+  font-family: var(--vw-font-serif);
+  font-size: 16.5px;
+  line-height: 1.7;
+  color: var(--vw-ink-primary);
+}
+
+.vw-split-doc-title {
+  font-size: 1.75em;
+  margin: 0 0 0.7em;
+  letter-spacing: -0.02em;
+}
+
+.vw-split-body h2,
+.vw-split-body h3,
+.vw-split-body h4 {
+  margin: 1.4em 0 0.4em;
+  line-height: 1.3;
+}
+
+.vw-split-body blockquote {
+  margin: 1em 0;
+  padding-left: 14px;
+  border-left: 2.5px solid var(--vw-border-strong);
+  color: var(--vw-ink-secondary);
+  font-style: italic;
+}
+
+.vw-split-body pre {
+  background: var(--vw-bg-code);
+  border: 1px solid var(--vw-border);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-family: var(--vw-font-mono);
+  font-size: 13px;
+  overflow-x: auto;
+}
+
+.vw-split-li {
+  margin: 4px 0 4px 8px;
+}
+
+.vw-split-math {
+  text-align: center;
+  padding: 10px 0;
+  font-style: italic;
+}
+
+/* ============================ MATH EQUATION BLOCK ============================ */
+
+.vw-math-box {
+  margin: 8px 0;
+  padding: 12px 16px;
+  border-radius: var(--vw-radius-sm);
+  background: var(--vw-bg-subtle);
+  border: 1px solid var(--vw-border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vw-math-preview {
+  text-align: center;
+  font-family: var(--vw-font-serif);
+  font-size: 1.2em;
+  font-style: italic;
+  min-height: 28px;
+  cursor: pointer;
+}
+
+.vw-math-placeholder {
+  font-family: var(--vw-font-ui);
+  font-size: 12.5px;
+  font-style: normal;
+  color: var(--vw-ink-muted);
+}
+
+.vw-math-frac {
+  display: inline-flex;
+  flex-direction: column;
+  vertical-align: middle;
+  text-align: center;
+  padding: 0 4px;
+  font-size: 0.9em;
+}
+
+.vw-math-num {
+  border-bottom: 1px solid currentColor;
+  padding: 0 3px 1px;
+}
+
+.vw-math-den {
+  padding: 1px 3px 0;
+}
+
+.vw-math-sqrt {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+.vw-math-radicand {
+  border-top: 1px solid currentColor;
+  padding: 0 2px;
+}
+
+.vw-math-input {
+  display: none;
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--vw-border-strong);
+  border-radius: 5px;
+  background: var(--vw-bg-elevated);
+  color: var(--vw-ink-primary);
+  font-family: var(--vw-font-mono);
+  font-size: 12.5px;
+  outline: none;
+}
+
+.vw-math-box.is-editing .vw-math-input {
+  display: block;
+}
+
+.vw-math-input:focus {
+  border-color: var(--vw-accent);
+}
+
+/* ============================ KEYBOARD SHORTCUTS MODAL ============================ */
+
+.vw-shortcuts-modal {
+  width: 100%;
+  max-width: 680px;
+  background: var(--vw-bg-elevated);
+  border: 1px solid var(--vw-border-strong);
+  border-radius: var(--vw-radius-lg);
+  box-shadow: var(--vw-float-shadow);
+  overflow: hidden;
+}
+
+.vw-shortcuts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  padding: 20px 22px 24px;
+}
+
+.vw-shortcut-col h3 {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vw-ink-muted);
+}
+
+.vw-sc-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--vw-border);
+}
+
+.vw-sc-row kbd {
+  font-family: var(--vw-font-mono);
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--vw-bg-subtle);
+  border: 1px solid var(--vw-border);
+  color: var(--vw-ink-secondary);
+}
+
+@media (max-width: 900px) {
+  .vw-split-pane {
+    display: none !important;
+  }
+
+  .vw-shortcuts-grid {
+    grid-template-columns: 1fr;
+  }
+}

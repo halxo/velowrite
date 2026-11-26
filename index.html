@@ -6,7 +6,7 @@
     <title>VeloWrite — Ultra-Fast Local-First Document Editor</title>
     <meta
       name="description"
-      content="VeloWrite is a local-first, sub-16ms document editor with virtualized 100-page rendering, instant Markdown formatting, IndexedDB autosave, and clean Markdown, DOCX, and JSON export."
+      content="VeloWrite is a local-first, sub-16ms document editor with virtualized 100-page rendering, instant Markdown formatting, IndexedDB autosave, and clean Markdown, DOCX, EPUB, HTML, and JSON export."
     />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -23,7 +23,7 @@
             type="button"
             id="vw-btn-toggle-sidebar"
             class="vw-icon-btn"
-            title="Toggle Sidebar (⌘\\)"
+            title="Toggle Sidebar (Ctrl/⌘ + \)"
             aria-label="Toggle Sidebar"
           ></button>
           <span class="vw-brand" aria-label="VeloWrite">VeloWrite</span>
@@ -44,6 +44,14 @@
         <div class="vw-topbar-right">
           <button
             type="button"
+            id="vw-btn-split"
+            class="vw-pill-btn"
+            title="Toggle Split Reference Pane (Ctrl/⌘ + Alt + \)"
+          >
+            Split
+          </button>
+          <button
+            type="button"
             id="vw-btn-page-mode"
             class="vw-pill-btn"
             title="Switch between Paginated and Continuous view"
@@ -52,13 +60,24 @@
             type="button"
             id="vw-btn-palette"
             class="vw-palette-trigger"
-            title="Open Command Palette (⌘K)"
+            title="Open Command Palette (Ctrl/⌘ + K)"
           >
             <span class="vw-palette-trigger-text">Commands</span>
             <kbd>⌘K</kbd>
           </button>
+          <button
+            type="button"
+            id="vw-btn-shortcuts"
+            class="vw-icon-btn"
+            title="Keyboard Shortcuts & Markdown Guide (Ctrl/⌘ + /)"
+            aria-label="Keyboard Shortcuts"
+          >
+            ?
+          </button>
         </div>
       </header>
+
+      <div id="vw-tab-bar" class="vw-tab-bar" role="tablist" aria-label="Open documents" hidden></div>
 
       <div class="vw-workspace">
         <aside id="vw-sidebar" class="vw-sidebar" aria-label="Document outline and files"></aside>
@@ -75,10 +94,17 @@
             ></article>
           </div>
         </main>
+
+        <section id="vw-split-pane" class="vw-split-pane" aria-label="Reference reader" hidden></section>
       </div>
 
       <footer id="vw-footer" class="vw-footer" aria-label="Document statistics"></footer>
-      <input type="file" id="vw-import-json-input" accept=".json,.md,.markdown,.txt,application/json,text/markdown,text/plain" hidden />
+      <input
+        type="file"
+        id="vw-import-json-input"
+        accept=".json,.velowrite,.md,.markdown,.txt,application/json,text/markdown,text/plain"
+        hidden
+      />
       <input type="file" id="vw-pick-image-input" accept="image/*" hidden />
     </div>
     <script type="module" src="/src/main.ts"></script>

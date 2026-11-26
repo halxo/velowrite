@@ -1,10 +1,213 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, screen, shell } = require('electron');
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 const { autoUpdater } = require('electron-updater');
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
+const SUPPORTED_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.json', '.velowrite']);
+
 let mainWindow = null;
+let rendererReady = false;
+let pendingOpenFilePath = null;
+let windowStateTimer = null;
+
+/* ==================== DIAGNOSTIC CRASH-SAFE LOGGER ==================== */
+
+function writeLog(level, message, detail) {
+  try {
+    const dir = app.getPath('userData');
+    const logPath = path.join(dir, 'velowrite.log');
+    const line = `[${new Date().toISOString()}] [${level}] ${message}${
+      detail ? ` :: ${detail}` : ''
+    }\n`;
+    try {
+      const stat = fsSync.statSync(logPath);
+      if (stat.size > 1024 * 1024) {
+        fsSync.renameSync(logPath, `${logPath}.1`);
+      }
+    } catch {
+      // Log file does not exist yet
+    }
+    fsSync.appendFileSync(logPath, line, 'utf8');
+  } catch {
+    // Never throw from logger
+  }
+}
+
+process.on('uncaughtException', (err) => {
+  writeLog('ERROR', 'UncaughtException', err && err.stack ? err.stack : String(err));
+});
+
+process.on('unhandledRejection', (reason) => {
+  writeLog('WARN', 'UnhandledRejection', String(reason));
+});
+
+/* ==================== PERSISTENT WINDOW BOUNDS ==================== */
+
+function getWindowStatePath() {
+  return path.join(app.getPath('userData'), 'window-state.json');
+}
+
+function loadWindowState() {
+  const defaults = { width: 1320, height: 860, isMaximized: false };
+  try {
+    const raw = fsSync.readFileSync(getWindowStatePath(), 'utf8');
+    const parsed = JSON.parse(raw);
+    const width = Math.max(780, Number(parsed.width) || defaults.width);
+    const height = Math.max(540, Number(parsed.height) || defaults.height);
+
+    if (typeof parsed.x === 'number' && typeof parsed.y === 'number') {
+      const displays = screen.getAllDisplays();
+      const visible = displays.some((d) => {
+        const b = d.bounds;
+        return (
+          parsed.x >= b.x - 100 &&
+          parsed.y >= b.y - 100 &&
+          parsed.x < b.x + b.width - 100 &&
+          parsed.y < b.y + b.height - 100
+        );
+      });
+      if (visible) {
+        return {
+          x: parsed.x,
+          y: parsed.y,
+          width,
+          height,
+          isMaximized: Boolean(parsed.isMaximized),
+        };
+      }
+    }
+    return { width, height, isMaximized: Boolean(parsed.isMaximized) };
+  } catch {
+    return defaults;
+  }
+}
+
+function scheduleSaveWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (windowStateTimer) clearTimeout(windowStateTimer);
+  windowStateTimer = setTimeout(() => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    try {
+      const isMaximized = mainWindow.isMaximized();
+      const bounds = isMaximized ? mainWindow.getNormalBounds() : mainWindow.getBounds();
+      fsSync.writeFileSync(
+        getWindowStatePath(),
+        JSON.stringify({ ...bounds, isMaximized }),
+        'utf8'
+      );
+    } catch {
+      // Ignore transient disk write failures
+    }
+  }, 300);
+}
+
+/* ==================== FILE ASSOCIATION / CLI PARSING ==================== */
+
+function extractFilePathFromArgv(argv) {
+  if (!Array.isArray(argv)) return null;
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!arg || arg.startsWith('-')) continue;
+    const ext = path.extname(arg).toLowerCase();
+    if (SUPPORTED_EXTENSIONS.has(ext) && fsSync.existsSync(arg)) {
+      return path.resolve(arg);
+    }
+  }
+  return null;
+}
+
+async function dispatchExternalFileToRenderer(filePath) {
+  if (!filePath) return;
+  if (!mainWindow || mainWindow.isDestroyed() || !rendererReady) {
+    pendingOpenFilePath = filePath;
+    return;
+  }
+  try {
+    const content = await fs.readFile(filePath, 'utf8');
+    mainWindow.webContents.send('velowrite:external-file-opened', {
+      filePath,
+      fileName: path.basename(filePath),
+      content,
+    });
+  } catch (err) {
+    writeLog('WARN', 'Failed to open external file', String(err));
+  }
+}
+
+/* ==================== NATIVE MENU BAR (MACOS + SHORTCUTS) ==================== */
+
+function buildNativeMenu() {
+  const isMac = process.platform === 'darwin';
+  const template = [
+    ...(isMac
+      ? [
+          {
+            label: app.name,
+            submenu: [
+              { role: 'about' },
+              { type: 'separator' },
+              {
+                label: 'Check for Updates…',
+                click: () => {
+                  if (app.isPackaged) void autoUpdater.checkForUpdates().catch(() => {});
+                },
+              },
+              { type: 'separator' },
+              { role: 'services' },
+              { type: 'separator' },
+              { role: 'hide' },
+              { role: 'hideOthers' },
+              { role: 'unhide' },
+              { type: 'separator' },
+              { role: 'quit' },
+            ],
+          },
+        ]
+      : []),
+    {
+      label: 'File',
+      submenu: [
+        isMac ? { role: 'close' } : { role: 'quit' },
+      ],
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'pasteAndMatchStyle' },
+        { role: 'selectAll' },
+      ],
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+      ],
+    },
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+      ],
+    },
+  ];
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+/* ==================== GITHUB RELEASES AUTO-UPDATER ==================== */
 
 function sendUpdateStatus(payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -53,17 +256,26 @@ function configureAutoUpdater() {
   });
 
   autoUpdater.on('error', (err) => {
+    const msg = err ? String(err.message || err) : 'Update check failed';
+    writeLog('WARN', 'AutoUpdaterError', msg);
     sendUpdateStatus({
       status: 'error',
-      message: err ? String(err.message || err) : 'Update check failed',
+      message: msg,
     });
   });
 }
 
+/* ==================== WINDOW LIFECYCLE ==================== */
+
 function createWindow() {
+  const winState = loadWindowState();
+  rendererReady = false;
+
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 840,
+    x: winState.x,
+    y: winState.y,
+    width: winState.width,
+    height: winState.height,
     minWidth: 780,
     minHeight: 540,
     title: 'VeloWrite',
@@ -79,9 +291,24 @@ function createWindow() {
     },
   });
 
+  if (winState.isMaximized) {
+    mainWindow.maximize();
+  }
+
   mainWindow.once('ready-to-show', () => {
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show();
+    }
+  });
+
+  mainWindow.on('resize', scheduleSaveWindowState);
+  mainWindow.on('move', scheduleSaveWindowState);
+  mainWindow.on('close', scheduleSaveWindowState);
+
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    writeLog('ERROR', 'RendererProcessGone', JSON.stringify(details));
+    if (mainWindow && !mainWindow.isDestroyed() && details.reason !== 'clean-exit') {
+      mainWindow.reload();
     }
   });
 
@@ -100,10 +327,21 @@ function createWindow() {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    rendererReady = false;
   });
 }
 
 function registerIpcHandlers() {
+  ipcMain.handle('velowrite:renderer-ready', async () => {
+    rendererReady = true;
+    if (pendingOpenFilePath) {
+      const target = pendingOpenFilePath;
+      pendingOpenFilePath = null;
+      await dispatchExternalFileToRenderer(target);
+    }
+    return true;
+  });
+
   ipcMain.handle('velowrite:get-app-info', () => ({
     version: app.getVersion(),
     platform: process.platform,
@@ -142,7 +380,7 @@ function registerIpcHandlers() {
       title: 'Open Document',
       properties: ['openFile'],
       filters: [
-        { name: 'VeloWrite & Markdown', extensions: ['md', 'markdown', 'json', 'txt'] },
+        { name: 'VeloWrite & Markdown', extensions: ['md', 'markdown', 'velowrite', 'json', 'txt'] },
         { name: 'All Files', extensions: ['*'] },
       ],
     });
@@ -165,17 +403,20 @@ function registerIpcHandlers() {
         defaultPath: payload.defaultName || 'document.md',
         filters: [
           { name: 'Markdown', extensions: ['md'] },
-          { name: 'VeloWrite JSON', extensions: ['json'] },
+          { name: 'VeloWrite Document', extensions: ['velowrite', 'json'] },
           { name: 'Plain Text', extensions: ['txt'] },
         ],
       });
       if (res.canceled || !res.filePath) return { canceled: true };
       targetPath = res.filePath;
     }
-    const content = targetPath.endsWith('.json')
-      ? payload.jsonContent
-      : payload.markdownContent;
-    await fs.writeFile(targetPath, content, 'utf8');
+    const content =
+      targetPath.endsWith('.json') || targetPath.endsWith('.velowrite')
+        ? payload.jsonContent
+        : payload.markdownContent;
+    const tmpPath = `${targetPath}.tmp`;
+    await fs.writeFile(tmpPath, content, 'utf8');
+    await fs.rename(tmpPath, targetPath);
     return {
       canceled: false,
       filePath: targetPath,
@@ -240,19 +481,35 @@ function registerIpcHandlers() {
   });
 }
 
+/* ==================== APP BOOTSTRAP ==================== */
+
+const initialCliFile = extractFilePathFromArgv(process.argv);
+if (initialCliFile) {
+  pendingOpenFilePath = initialCliFile;
+}
+
+app.on('open-file', (event, filePath) => {
+  event.preventDefault();
+  void dispatchExternalFileToRenderer(filePath);
+});
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, commandLine) => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.focus();
     }
+    const secondFile = extractFilePathFromArgv(commandLine);
+    if (secondFile) {
+      void dispatchExternalFileToRenderer(secondFile);
+    }
   });
 
   app.whenReady().then(() => {
-    Menu.setApplicationMenu(null);
+    buildNativeMenu();
     registerIpcHandlers();
     configureAutoUpdater();
     createWindow();

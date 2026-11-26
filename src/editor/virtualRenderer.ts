@@ -18,6 +18,7 @@ import {
   splitHtmlAtCaret,
 } from './selectionUtils';
 import { CodeSyntaxHighlighter, SUPPORTED_CODE_LANGUAGES } from './syntaxHighlight';
+import { renderLatexEquationHtml } from './mathRenderer';
 
 export interface SlashTriggerState {
   open: boolean;
@@ -57,6 +58,8 @@ function estimateBlockHeight(block: Block): number {
       return 38;
     case 'divider':
       return 32;
+    case 'math':
+      return 76;
     case 'image':
       return 280;
     case 'table':
@@ -765,6 +768,11 @@ export class VirtualDocumentRenderer {
       return;
     }
 
+    if (block.type === 'math') {
+      this.renderMathBlock(wrapper, block);
+      return;
+    }
+
     if (block.type === 'bullet-list') {
       const marker = document.createElement('span');
       marker.className = 'vw-list-marker vw-list-marker--bullet';
@@ -888,6 +896,65 @@ export class VirtualDocumentRenderer {
     } else {
       wrapper.appendChild(editable);
     }
+  }
+
+  private renderMathBlock(wrapper: HTMLElement, block: Block): void {
+    const box = document.createElement('div');
+    box.className = 'vw-math-box';
+    box.contentEditable = 'false';
+
+    const preview = document.createElement('div');
+    preview.className = 'vw-math-preview';
+    preview.innerHTML = renderLatexEquationHtml(block.text);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'vw-math-input';
+    input.placeholder = 'LaTeX formula, e.g. \\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}';
+    input.value = block.text;
+    input.spellcheck = false;
+
+    preview.addEventListener('click', () => {
+      box.classList.add('is-editing');
+      input.focus();
+    });
+
+    input.addEventListener('focus', () => {
+      this.activeBlockId = block.id;
+      box.classList.add('is-editing');
+    });
+
+    input.addEventListener('blur', () => {
+      if (input.value.trim()) {
+        box.classList.remove('is-editing');
+      }
+    });
+
+    input.addEventListener('input', () => {
+      preview.innerHTML = renderLatexEquationHtml(input.value);
+      this.store.updateBlockContent(block.id, input.value, input.value, false);
+    });
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        box.classList.remove('is-editing');
+        const next = this.store.insertBlockAfter(block.id, 'paragraph', '');
+        this.focusBlock(next.id, 0);
+      } else if (e.key === 'Backspace' && input.value === '') {
+        e.preventDefault();
+        this.store.setBlockType(block.id, 'paragraph', '');
+        this.focusBlock(block.id, 0);
+      }
+    });
+
+    if (!block.text.trim()) {
+      box.classList.add('is-editing');
+    }
+
+    box.appendChild(preview);
+    box.appendChild(input);
+    wrapper.appendChild(box);
   }
 
   private renderImageBlock(wrapper: HTMLElement, block: Block): void {
@@ -1515,6 +1582,13 @@ export class VirtualDocumentRenderer {
     if (editable) {
       editable.focus({ preventScroll: false });
       setCaretOffsetInElement(editable, offset);
+      this.activeBlockId = blockId;
+      return;
+    }
+    const mathInput = wrapper.querySelector<HTMLInputElement>('.vw-math-input');
+    if (mathInput) {
+      wrapper.querySelector('.vw-math-box')?.classList.add('is-editing');
+      mathInput.focus({ preventScroll: false });
       this.activeBlockId = blockId;
     } else {
       wrapper.focus();

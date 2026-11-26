@@ -1,34 +1,30 @@
 # VeloWrite
 
-An ultra-fast, local-first Google Docs alternative engineered for **sub-16ms input latency**, instant startup, and locked **60–120fps** scrolling across 100-page manuscripts — packaged as a native **Windows desktop `.exe` app** with a built-in **GitHub Releases auto-updater**.
+An ultra-fast, local-first Google Docs alternative engineered for **sub-16ms input latency**, instant startup, and locked **60–120fps** scrolling across 100-page manuscripts — packaged as native **Windows (`.exe`), macOS (`.dmg`), and Linux (`.AppImage` / `.deb`)** desktop applications with a built-in **GitHub Releases auto-updater**.
 
-## Download Desktop App (Windows `.exe`)
+## Download Desktop Installers (`v1.2.0`)
 
-Download the latest installer from **[GitHub Releases](https://github.com/halxo/velowrite/releases/latest)**:
+Download the latest installers from **[GitHub Releases](https://github.com/halxo/velowrite/releases/latest)**:
 
-- **Windows Installer**: `VeloWrite-Setup-1.0.0.exe` (includes desktop & Start Menu shortcuts, uninstaller, and automatic background updates from `halxo/velowrite`)
+- **Windows (x64)**: `VeloWrite-Setup-1.2.0.exe` — NSIS installer with Desktop/Start Menu shortcuts, `.md` & `.velowrite` file associations, uninstaller, and automatic background updates.
+- **macOS (Universal Apple Silicon + Intel)**: `VeloWrite-1.2.0-universal.dmg`
+- **Linux (x64)**: `VeloWrite-1.2.0.AppImage` and `velowrite_1.2.0_amd64.deb`
 
-## Built-in Auto-Updater
+## Key Capabilities
 
-VeloWrite checks `https://github.com/halxo/velowrite/releases` automatically on startup (and every 4 hours) using `electron-updater`. When a new release is published:
+- **Virtualized 100-Page Canvas**: `Float64Array` prefix-sum height cache + `O(log N)` viewport binary search + `ResizeObserver` batching keeps ~40–55 DOM nodes mounted even on 50,000-word manuscripts.
+- **Multi-Document Tabs & Split Reference View**: Open multiple local documents in tabs (`Ctrl+Tab`) or read a reference document / live preview side-by-side (`Ctrl/Cmd+Alt+\`).
+- **Rich Blocks & Technical Writing**: Headings, bullet/numbered lists, interactive checklists (`[] `), callouts (`! `), collapsible toggles (`>> `), editable tables (`/table`), display LaTeX math equations (`$$` / `/math`), local IndexedDB images (`/image` or paste/drop), and zero-DOM-mutation syntax-highlighted code blocks.
+- **Universal Export & Native Disk I/O**: Open & save `.md` / `.velowrite` / `.json` directly on disk (`Ctrl/Cmd+O`, `Ctrl/Cmd+S`) and export to **PDF**, **DOCX**, **EPUB 3.0**, **Standalone HTML**, **Markdown**, or **JSON**.
+- **Version Snapshots, Visual Diff & Folder Sync**: Save local checkpoints in IndexedDB with word-level visual diffs, and mirror manuscripts atomically to iCloud, OneDrive, Dropbox, or Syncthing folders.
 
-1. The update downloads quietly in the background with a live progress pill.
-2. Once ready, click **Restart & Update** (or restart VeloWrite later to install automatically).
-3. You can also trigger a manual check anytime from the Command Palette (`Ctrl+K` → **Check for Updates (GitHub)**).
-
-## Architecture
-
-- **Document Data Model (`src/model/`)**: Block-oriented schema with `O(1)` ID-to-index lookup, `O(1)` incremental word/character/reading-time counters, cached heading outline, and coalesced undo/redo history.
-- **Virtualized Rendering Engine (`src/editor/`)**: Windowed virtual DOM backed by a `Float64Array` prefix-sum height cache, `O(log N)` binary search viewport slicing, `ResizeObserver` height tracking, and `requestAnimationFrame`-batched transforms.
-- **IndexedDB Storage & Exporters (`src/storage/`)**: Zero-latency optimistic autosave flushed during `requestIdleCallback`, plus zero-dependency **Markdown (`.md`)**, **Word (`.docx`)**, and **JSON (`.json`)** exporters.
-- **Desktop Shell & Auto-Updater (`electron/`)**: Context-isolated Electron main/preload architecture with single-instance locking and `electron-updater` GitHub Releases integration.
-
-## Development & Release
+## Development & Automated Verification
 
 ```bash
 npm install
-npm run dev          # Run web dev server
-npm run dist:win     # Build Windows NSIS .exe installer locally
+npm test             # Run Vitest unit, exporter, and 50k-word latency benchmark suite
+npm run dev          # Launch Vite web dev server
+npm run build        # Type-check and build production bundle
 ```
 
-Push a version tag (e.g. `git tag v1.0.1 && git push origin v1.0.1`) to automatically build and publish a new Windows `.exe` release via GitHub Actions.
+Push a version tag (e.g. `git tag v1.2.1 && git push origin v1.2.1`) to run the test suite and publish Windows, macOS, and Linux installers automatically via GitHub Actions.

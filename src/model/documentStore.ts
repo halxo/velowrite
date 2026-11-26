@@ -72,7 +72,7 @@ export function createBlock(
   align?: TextAlign,
   extra?: Partial<Block>
 ): Block {
-  const text = type === 'code-block' ? html : extractPlainText(html);
+  const text = type === 'code-block' || type === 'math' ? html : extractPlainText(html);
   const tableData =
     extra?.tableData ??
     (type === 'table'
@@ -327,7 +327,7 @@ export class DocumentStore {
     const text =
       plainText !== undefined
         ? plainText
-        : block.type === 'code-block'
+        : block.type === 'code-block' || block.type === 'math'
           ? html
           : extractPlainText(html);
 
@@ -388,13 +388,16 @@ export class DocumentStore {
     }
 
     if (newHtml !== undefined) {
-      const text = newType === 'code-block' ? newHtml : extractPlainText(newHtml);
+      const text =
+        newType === 'code-block' || newType === 'math'
+          ? newHtml
+          : extractPlainText(newHtml);
       block.html = newHtml;
       block.text = text;
     } else if (newType === 'divider' || newType === 'image' || newType === 'table') {
       block.html = '';
       block.text = '';
-    } else if (newType === 'code-block') {
+    } else if (newType === 'code-block' || newType === 'math') {
       block.html = block.text;
     }
 

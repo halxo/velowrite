@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('velowriteDesktop', {
+  notifyRendererReady: () => ipcRenderer.invoke('velowrite:renderer-ready'),
   getAppInfo: () => ipcRenderer.invoke('velowrite:get-app-info'),
   checkForUpdates: () => ipcRenderer.invoke('velowrite:check-for-updates'),
   installUpdate: () => ipcRenderer.invoke('velowrite:install-update'),
@@ -14,5 +15,10 @@ contextBridge.exposeInMainWorld('velowriteDesktop', {
     const handler = (_event, payload) => callback(payload);
     ipcRenderer.on('velowrite:update-status', handler);
     return () => ipcRenderer.removeListener('velowrite:update-status', handler);
+  },
+  onExternalFileOpened: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('velowrite:external-file-opened', handler);
+    return () => ipcRenderer.removeListener('velowrite:external-file-opened', handler);
   },
 });
