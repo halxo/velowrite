@@ -1,6 +1,7 @@
 import { DocumentStore, type StoreChangeEvent } from '../model/documentStore';
-import { escapeHtml, sanitizeInlineHtml } from '../model/sanitize';
-import type { Block, BlockType, TextAlign } from '../model/types';
+import { escapeHtml, generateId, sanitizeInlineHtml } from '../model/sanitize';
+import type { Block, BlockType, ImageWidthPreset, TextAlign } from '../model/types';
+import type { VeloStorage } from '../storage/indexedDB';
 import {
   applyInlineFormat,
   detectMarkdownBlockTrigger,
@@ -16,6 +17,7 @@ import {
   setCaretOffsetInElement,
   splitHtmlAtCaret,
 } from './selectionUtils';
+import { CodeSyntaxHighlighter, SUPPORTED_CODE_LANGUAGES } from './syntaxHighlight';
 
 export interface SlashTriggerState {
   open: boolean;
@@ -40,6 +42,7 @@ export interface VirtualRendererCallbacks {
   onLatencySample: (ms: number) => void;
   onActiveHeadingChange: (headingId: string | null) => void;
   onTypingActivity: () => void;
+  onRequestImagePick: (blockId: string) => void;
 }
 
 const OVERSCAN = 14;
@@ -54,9 +57,17 @@ function estimateBlockHeight(block: Block): number {
       return 38;
     case 'divider':
       return 32;
+    case 'image':
+      return 280;
+    case 'table':
+      return Math.max(120, (block.tableData?.length ?? 3) * 38 + 36);
+    case 'toggle':
+      return block.collapsed ? 42 : 96;
+    case 'callout':
+      return Math.max(54, Math.ceil(Math.max(1, block.charCount) / 72) * 28 + 24);
     case 'code-block': {
       const lines = Math.max(1, block.text.split('\n').length);
-      return 36 + lines * 22;
+      return 56 + lines * 22;
     }
     case 'blockquote':
       return Math.max(44, Math.ceil(Math.max(1, block.charCount) / 72) * 28 + 16);
@@ -69,11 +80,13 @@ function estimateBlockHeight(block: Block): number {
 
 export class VirtualDocumentRenderer {
   private store: DocumentStore;
+  private storage: VeloStorage;
   private scrollContainer: HTMLElement;
   private pageSurface: HTMLElement;
   private spacerEl: HTMLElement;
   private viewportEl: HTMLElement;
   private callbacks: VirtualRendererCallbacks;
+  private syntaxHighlighter = new CodeSyntaxHighlighter();
 
   private heights: Float64Array = new Float64Array(0);
   private offsets: Float64Array = new Float64Array(1);
@@ -85,6 +98,12 @@ export class VirtualDocumentRenderer {
   private renderedEnd = -1;
   private activeBlockId: string | null = null;
   private slashActiveBlockId: string | null = null;
+  private draggedBlockId: string | null = null;
+  private typewriterMode = false;
+
+  private searchQuery = '';
+  private searchCaseSensitive = false;
+  private searchUseRegex = false;
 
   private rafRenderScheduled = false;
   private rafOffsetsScheduled = false;
@@ -94,11 +113,13 @@ export class VirtualDocumentRenderer {
 
   constructor(
     store: DocumentStore,
+    storage: VeloStorage,
     scrollContainer: HTMLElement,
     pageSurface: HTMLElement,
     callbacks: VirtualRendererCallbacks
   ) {
     this.store = store;
+    this.storage = storage;
     this.scrollContainer = scrollContainer;
     this.pageSurface = pageSurface;
     this.callbacks = callbacks;
@@ -147,6 +168,74 @@ export class VirtualDocumentRenderer {
     document.removeEventListener('selectionchange', this.handleSelectionChange);
   }
 
+  setTypewriterMode(enabled: boolean): void {
+    this.typewriterMode = enabled;
+    if (enabled && this.activeBlockId) {
+      const el = this.mountedNodes.get(this.activeBlockId);
+      if (el) this.centerElementInViewport(el);
+    }
+  }
+
+  setSearchHighlights(query: string, caseSensitive: boolean, useRegex: boolean): void {
+    this.searchQuery = query;
+    this.searchCaseSensitive = caseSensitive;
+    this.searchUseRegex = useRegex;
+    this.refreshSearchHighlights();
+  }
+
+  private refreshSearchHighlights(): void {
+    const cssHighlights = (CSS as unknown as { highlights?: Map<string, unknown> }).highlights;
+    const HighlightCtor = (window as unknown as { Highlight?: new (...ranges: Range[]) => unknown })
+      .Highlight;
+    if (!cssHighlights || !HighlightCtor) return;
+
+    if (!this.searchQuery) {
+      cssHighlights.delete('vw-find-match');
+      return;
+    }
+
+    let regex: RegExp;
+    try {
+      const pattern = this.searchUseRegex
+        ? this.searchQuery
+        : this.searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      regex = new RegExp(pattern, this.searchCaseSensitive ? 'g' : 'gi');
+    } catch {
+      cssHighlights.delete('vw-find-match');
+      return;
+    }
+
+    const ranges: Range[] = [];
+    for (const wrapper of this.mountedNodes.values()) {
+      const editable = wrapper.querySelector<HTMLElement>('.vw-block-content');
+      if (!editable) continue;
+      const walker = document.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+      let node = walker.nextNode() as Text | null;
+      while (node) {
+        const text = node.nodeValue ?? '';
+        regex.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = regex.exec(text)) !== null) {
+          if (m[0].length === 0) {
+            regex.lastIndex++;
+            continue;
+          }
+          const r = document.createRange();
+          r.setStart(node, m.index);
+          r.setEnd(node, m.index + m[0].length);
+          ranges.push(r);
+        }
+        node = walker.nextNode() as Text | null;
+      }
+    }
+
+    if (ranges.length > 0) {
+      cssHighlights.set('vw-find-match', new HighlightCtor(...ranges));
+    } else {
+      cssHighlights.delete('vw-find-match');
+    }
+  }
+
   private bindEvents(): void {
     this.scrollContainer.addEventListener('scroll', this.handleScroll, { passive: true });
     document.addEventListener('selectionchange', this.handleSelectionChange);
@@ -160,6 +249,56 @@ export class VirtualDocumentRenderer {
         }
       }
     });
+
+    // Drag & drop local image files directly onto the document canvas
+    this.pageSurface.addEventListener('dragover', (e) => {
+      if (e.dataTransfer?.types.includes('Files')) {
+        e.preventDefault();
+      }
+    });
+
+    this.pageSurface.addEventListener('drop', (e) => {
+      const files = e.dataTransfer?.files;
+      if (files && files.length > 0) {
+        const imgFile = Array.from(files).find((f) => f.type.startsWith('image/'));
+        if (imgFile) {
+          e.preventDefault();
+          const targetWrapper = this.findBlockWrapper(e.target as Node);
+          const afterId =
+            targetWrapper?.dataset.blockId ??
+            this.activeBlockId ??
+            this.store.getBlocks()[this.store.getBlockCount() - 1]?.id;
+          if (afterId) {
+            void this.insertImageBlobAfter(afterId, imgFile);
+          }
+        }
+      }
+    });
+  }
+
+  async insertImageBlobAfter(afterBlockId: string, blob: Blob, replaceIfEmpty = false): Promise<void> {
+    const assetId = `img_${generateId()}`;
+    await this.storage.saveAsset(assetId, blob);
+
+    const existing = this.store.getBlockById(afterBlockId);
+    if (replaceIfEmpty && existing && existing.type === 'paragraph' && existing.text.trim() === '') {
+      const idx = this.store.getBlockIndex(afterBlockId);
+      this.store.deleteBlock(afterBlockId);
+      const inserted = this.store.insertBlockAt(Math.max(0, idx), 'image', '', {
+        imageAssetId: assetId,
+        imageWidth: 'wide',
+        imageCaption: '',
+      });
+      this.store.insertBlockAfter(inserted.id, 'paragraph', '');
+      return;
+    }
+
+    const imgBlock = this.store.insertBlockAfter(afterBlockId, 'image', '', {
+      imageAssetId: assetId,
+      imageWidth: 'wide',
+      imageCaption: '',
+    });
+    this.store.insertBlockAfter(imgBlock.id, 'paragraph', '');
   }
 
   private handleScroll = (): void => {
@@ -223,7 +362,13 @@ export class VirtualDocumentRenderer {
     if (!blockEl) return;
     const blockId = blockEl.dataset.blockId ?? '';
     const block = this.store.getBlockById(blockId);
-    if (!block || block.type === 'code-block' || block.type === 'divider') {
+    if (
+      !block ||
+      block.type === 'code-block' ||
+      block.type === 'divider' ||
+      block.type === 'image' ||
+      block.type === 'table'
+    ) {
       return;
     }
 
@@ -261,6 +406,7 @@ export class VirtualDocumentRenderer {
     switch (ev.kind) {
       case 'load':
       case 'block-replace-all':
+      case 'block-move':
         this.resetMetricsAndRender();
         break;
       case 'settings':
@@ -276,6 +422,8 @@ export class VirtualDocumentRenderer {
         if (ev.blockId) {
           const el = this.mountedNodes.get(ev.blockId);
           if (el) {
+            const editable = el.querySelector<HTMLElement>('.vw-block-content');
+            if (editable) this.syntaxHighlighter.unregister(editable);
             this.resizeObserver.unobserve(el);
             el.remove();
             this.mountedNodes.delete(ev.blockId);
@@ -287,8 +435,9 @@ export class VirtualDocumentRenderer {
         break;
       case 'block-type':
       case 'block-align':
+      case 'block-meta':
         if (ev.blockId) {
-          this.syncSingleBlockDom(ev.blockId, true);
+          this.syncSingleBlockDom(ev.blockId, ev.kind !== 'block-meta');
           this.refreshOrderedListNumbers();
         }
         break;
@@ -300,13 +449,19 @@ export class VirtualDocumentRenderer {
       default:
         break;
     }
+    if (this.searchQuery) {
+      this.refreshSearchHighlights();
+    }
   }
 
   applyDocumentSettings(): void {
-    const { pageMode, margins, font } = this.store.getDocument().settings;
+    const { pageMode, margins, font, lineSpacing, pageSize } =
+      this.store.getDocument().settings;
     this.pageSurface.dataset.pageMode = pageMode;
     this.pageSurface.dataset.margins = margins;
     this.pageSurface.dataset.font = font;
+    this.pageSurface.dataset.lineSpacing = lineSpacing ?? 'normal';
+    this.pageSurface.dataset.pageSize = pageSize ?? 'letter';
   }
 
   private ensureCapacity(n: number): void {
@@ -340,6 +495,8 @@ export class VirtualDocumentRenderer {
 
   private resetMetricsAndRender(): void {
     for (const el of this.mountedNodes.values()) {
+      const editable = el.querySelector<HTMLElement>('.vw-block-content');
+      if (editable) this.syntaxHighlighter.unregister(editable);
       this.resizeObserver.unobserve(el);
       el.remove();
     }
@@ -431,7 +588,6 @@ export class VirtualDocumentRenderer {
       activeSet.add(blocks[i].id);
     }
 
-    // Never unmount the block currently holding keyboard focus while typing
     if (this.activeBlockId && !activeSet.has(this.activeBlockId)) {
       const activeIdx = this.store.getBlockIndex(this.activeBlockId);
       if (activeIdx >= 0 && Math.abs(activeIdx - firstVisible) < 40) {
@@ -439,16 +595,16 @@ export class VirtualDocumentRenderer {
       }
     }
 
-    // Unmount out-of-window blocks
     for (const [id, el] of this.mountedNodes) {
       if (!activeSet.has(id)) {
+        const editable = el.querySelector<HTMLElement>('.vw-block-content');
+        if (editable) this.syntaxHighlighter.unregister(editable);
         this.resizeObserver.unobserve(el);
         el.remove();
         this.mountedNodes.delete(id);
       }
     }
 
-    // Mount & order blocks in [start..end] without touching unchanged existing nodes
     let cursorNode: ChildNode | null = this.viewportEl.firstChild;
     for (let i = start; i <= end; i++) {
       const block = blocks[i];
@@ -474,6 +630,10 @@ export class VirtualDocumentRenderer {
     this.renderedStart = start;
     this.renderedEnd = end;
     this.viewportEl.style.transform = `translate3d(0, ${this.offsets[start]}px, 0)`;
+
+    if (this.searchQuery) {
+      this.refreshSearchHighlights();
+    }
   }
 
   private updateActiveHeading(firstVisibleIndex: number): void {
@@ -510,15 +670,69 @@ export class VirtualDocumentRenderer {
       wrapper.style.textAlign = block.align;
     }
 
+    this.attachDragEvents(wrapper, block.id);
     this.populateBlockInner(wrapper, block, index);
     return wrapper;
   }
 
+  private attachDragEvents(wrapper: HTMLElement, blockId: string): void {
+    wrapper.addEventListener('dragover', (e) => {
+      if (!this.draggedBlockId || this.draggedBlockId === blockId) return;
+      e.preventDefault();
+      wrapper.classList.add('is-drag-over');
+    });
+
+    wrapper.addEventListener('dragleave', () => {
+      wrapper.classList.remove('is-drag-over');
+    });
+
+    wrapper.addEventListener('drop', (e) => {
+      wrapper.classList.remove('is-drag-over');
+      if (!this.draggedBlockId || this.draggedBlockId === blockId) return;
+      e.preventDefault();
+      const fromIdx = this.store.getBlockIndex(this.draggedBlockId);
+      const toIdx = this.store.getBlockIndex(blockId);
+      this.draggedBlockId = null;
+      if (fromIdx >= 0 && toIdx >= 0) {
+        this.store.moveBlock(fromIdx, toIdx);
+      }
+    });
+  }
+
+  private createDragHandle(blockId: string): HTMLSpanElement {
+    const handle = document.createElement('span');
+    handle.className = 'vw-drag-handle';
+    handle.contentEditable = 'false';
+    handle.draggable = true;
+    handle.title = 'Drag to reorder (or Ctrl+Shift+↑/↓)';
+    handle.textContent = '⋮⋮';
+    handle.addEventListener('dragstart', (e) => {
+      this.draggedBlockId = blockId;
+      e.dataTransfer?.setData('text/plain', blockId);
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+    });
+    handle.addEventListener('dragend', () => {
+      this.draggedBlockId = null;
+      this.viewportEl
+        .querySelectorAll('.is-drag-over')
+        .forEach((el) => el.classList.remove('is-drag-over'));
+    });
+    return handle;
+  }
+
   private populateBlockInner(wrapper: HTMLElement, block: Block, index: number): void {
+    const prevEditable = wrapper.querySelector<HTMLElement>('.vw-block-content');
+    if (prevEditable) this.syntaxHighlighter.unregister(prevEditable);
+
     wrapper.innerHTML = '';
     wrapper.className = `vw-block vw-block--${block.type}`;
     wrapper.dataset.blockType = block.type;
     wrapper.style.textAlign = block.align && block.align !== 'left' ? block.align : '';
+    if (block.type === 'todo' && block.checked) {
+      wrapper.classList.add('is-checked');
+    }
+
+    wrapper.appendChild(this.createDragHandle(block.id));
 
     if (block.type === 'divider') {
       const hr = document.createElement('hr');
@@ -541,6 +755,16 @@ export class VirtualDocumentRenderer {
       return;
     }
 
+    if (block.type === 'image') {
+      this.renderImageBlock(wrapper, block);
+      return;
+    }
+
+    if (block.type === 'table') {
+      this.renderTableBlock(wrapper, block);
+      return;
+    }
+
     if (block.type === 'bullet-list') {
       const marker = document.createElement('span');
       marker.className = 'vw-list-marker vw-list-marker--bullet';
@@ -553,6 +777,54 @@ export class VirtualDocumentRenderer {
       marker.contentEditable = 'false';
       marker.textContent = `${this.store.getNumberedListIndex(index)}.`;
       wrapper.appendChild(marker);
+    } else if (block.type === 'todo') {
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'vw-todo-checkbox';
+      checkbox.checked = !!block.checked;
+      checkbox.setAttribute('aria-label', 'Toggle task');
+      checkbox.addEventListener('change', () => {
+        this.store.toggleTodoChecked(block.id);
+      });
+      wrapper.appendChild(checkbox);
+    } else if (block.type === 'callout') {
+      const badge = document.createElement('span');
+      badge.className = 'vw-callout-icon';
+      badge.contentEditable = 'false';
+      badge.textContent = '✦';
+      wrapper.appendChild(badge);
+    } else if (block.type === 'toggle') {
+      const chevron = document.createElement('button');
+      chevron.type = 'button';
+      chevron.className = `vw-toggle-chevron${block.collapsed ? ' is-collapsed' : ''}`;
+      chevron.contentEditable = 'false';
+      chevron.textContent = '▾';
+      chevron.title = 'Expand / Collapse';
+      chevron.addEventListener('click', () => {
+        this.store.toggleSectionCollapsed(block.id);
+      });
+      wrapper.appendChild(chevron);
+    }
+
+    if (block.type === 'code-block') {
+      const langBar = document.createElement('div');
+      langBar.className = 'vw-code-header';
+      langBar.contentEditable = 'false';
+      const select = document.createElement('select');
+      select.className = 'vw-code-lang-select';
+      select.setAttribute('aria-label', 'Code language');
+      for (const lang of SUPPORTED_CODE_LANGUAGES) {
+        const opt = document.createElement('option');
+        opt.value = lang;
+        opt.textContent = lang;
+        opt.selected = (block.codeLang ?? 'typescript') === lang;
+        select.appendChild(opt);
+      }
+      select.addEventListener('change', () => {
+        this.store.updateCodeLanguage(block.id, select.value);
+      });
+      langBar.appendChild(select);
+      wrapper.appendChild(langBar);
     }
 
     const editable = document.createElement('div');
@@ -563,13 +835,20 @@ export class VirtualDocumentRenderer {
 
     if (block.type === 'code-block') {
       editable.textContent = block.text;
+      this.syntaxHighlighter.register(editable, block.codeLang ?? 'typescript');
     } else {
       editable.innerHTML = block.html;
     }
 
     editable.addEventListener('focus', () => {
       this.activeBlockId = block.id;
+      this.viewportEl
+        .querySelectorAll('.vw-block.is-focused')
+        .forEach((el) => el.classList.remove('is-focused'));
       wrapper.classList.add('is-focused');
+      if (this.typewriterMode) {
+        this.centerElementInViewport(wrapper);
+      }
     });
 
     editable.addEventListener('blur', () => {
@@ -588,7 +867,143 @@ export class VirtualDocumentRenderer {
       this.handleBlockPaste(e, block.id, editable);
     });
 
-    wrapper.appendChild(editable);
+    if (block.type === 'toggle') {
+      const toggleStack = document.createElement('div');
+      toggleStack.className = 'vw-toggle-stack';
+      toggleStack.appendChild(editable);
+
+      if (!block.collapsed) {
+        const bodyInput = document.createElement('textarea');
+        bodyInput.className = 'vw-toggle-body';
+        bodyInput.placeholder = 'Write collapsible details…';
+        bodyInput.value = block.toggleBody ?? '';
+        bodyInput.rows = Math.max(2, (block.toggleBody ?? '').split('\n').length);
+        bodyInput.addEventListener('input', () => {
+          bodyInput.rows = Math.max(2, bodyInput.value.split('\n').length);
+          this.store.updateToggleBody(block.id, bodyInput.value);
+        });
+        toggleStack.appendChild(bodyInput);
+      }
+      wrapper.appendChild(toggleStack);
+    } else {
+      wrapper.appendChild(editable);
+    }
+  }
+
+  private renderImageBlock(wrapper: HTMLElement, block: Block): void {
+    const figure = document.createElement('figure');
+    figure.className = `vw-image-figure vw-image--${block.imageWidth ?? 'wide'}`;
+    figure.contentEditable = 'false';
+
+    if (!block.imageAssetId) {
+      const placeholderBtn = document.createElement('button');
+      placeholderBtn.type = 'button';
+      placeholderBtn.className = 'vw-image-placeholder';
+      placeholderBtn.textContent = 'Click to choose a local image (stored in IndexedDB)…';
+      placeholderBtn.addEventListener('click', () => this.callbacks.onRequestImagePick(block.id));
+      figure.appendChild(placeholderBtn);
+      wrapper.appendChild(figure);
+      return;
+    }
+
+    const img = document.createElement('img');
+    img.className = 'vw-image-el';
+    img.alt = block.imageCaption || 'Document image';
+    void this.storage.getAssetUrl(block.imageAssetId).then((url) => {
+      if (url) img.src = url;
+    });
+
+    const controls = document.createElement('div');
+    controls.className = 'vw-image-controls';
+    (['inline', 'wide', 'full'] as ImageWidthPreset[]).forEach((preset) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `vw-img-size-btn${(block.imageWidth ?? 'wide') === preset ? ' is-active' : ''}`;
+      btn.textContent = preset;
+      btn.addEventListener('click', () => {
+        this.store.updateImageMeta(block.id, { imageWidth: preset });
+      });
+      controls.appendChild(btn);
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'vw-img-size-btn vw-img-del-btn';
+    delBtn.textContent = 'Remove';
+    delBtn.addEventListener('click', () => {
+      this.store.deleteBlock(block.id);
+    });
+    controls.appendChild(delBtn);
+
+    const caption = document.createElement('input');
+    caption.type = 'text';
+    caption.className = 'vw-image-caption';
+    caption.placeholder = 'Write a caption…';
+    caption.value = block.imageCaption ?? '';
+    caption.addEventListener('input', () => {
+      this.store.updateImageMeta(block.id, { imageCaption: caption.value });
+    });
+
+    figure.appendChild(controls);
+    figure.appendChild(img);
+    figure.appendChild(caption);
+    wrapper.appendChild(figure);
+  }
+
+  private renderTableBlock(wrapper: HTMLElement, block: Block): void {
+    const data = block.tableData ?? [
+      ['Column 1', 'Column 2'],
+      ['', ''],
+    ];
+
+    const container = document.createElement('div');
+    container.className = 'vw-table-wrap';
+    container.contentEditable = 'false';
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'vw-table-toolbar';
+    toolbar.innerHTML = `
+      <button type="button" data-op="add-row">+ Row</button>
+      <button type="button" data-op="remove-row">- Row</button>
+      <button type="button" data-op="add-col">+ Col</button>
+      <button type="button" data-op="remove-col">- Col</button>
+      <button type="button" data-op="delete-table" class="vw-table-del">Delete</button>
+    `;
+    toolbar.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button');
+      if (!btn) return;
+      const op = btn.dataset.op;
+      if (op === 'delete-table') {
+        this.store.deleteBlock(block.id);
+      } else if (op === 'add-row' || op === 'remove-row' || op === 'add-col' || op === 'remove-col') {
+        this.store.mutateTableStructure(block.id, op);
+      }
+    });
+
+    const table = document.createElement('table');
+    table.className = 'vw-table';
+
+    data.forEach((row, rIdx) => {
+      const tr = document.createElement('tr');
+      row.forEach((cellVal, cIdx) => {
+        const cellEl = document.createElement(rIdx === 0 ? 'th' : 'td');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'vw-table-cell-input';
+        input.value = cellVal;
+        input.placeholder = rIdx === 0 ? `Header ${cIdx + 1}` : '';
+        input.addEventListener('input', () => {
+          this.store.updateTableCell(block.id, rIdx, cIdx, input.value);
+        });
+        cellEl.appendChild(input);
+        tr.appendChild(cellEl);
+      });
+      table.appendChild(tr);
+    });
+
+    container.appendChild(toolbar);
+    container.appendChild(table);
+    wrapper.appendChild(container);
   }
 
   private placeholderForType(type: BlockType): string {
@@ -599,6 +1014,12 @@ export class VirtualDocumentRenderer {
         return 'Heading 2';
       case 'heading3':
         return 'Heading 3';
+      case 'todo':
+        return 'To-do item…';
+      case 'callout':
+        return 'Write a callout note…';
+      case 'toggle':
+        return 'Toggle heading…';
       case 'blockquote':
         return 'Write a quote…';
       case 'code-block':
@@ -624,12 +1045,26 @@ export class VirtualDocumentRenderer {
 
     this.populateBlockInner(wrapper, block, idx);
 
-    if (wasFocused && block.type !== 'divider') {
+    if (
+      wasFocused &&
+      block.type !== 'divider' &&
+      block.type !== 'image' &&
+      block.type !== 'table'
+    ) {
       const nextEditable = wrapper.querySelector<HTMLElement>('.vw-block-content');
       if (nextEditable) {
         nextEditable.focus({ preventScroll: true });
         setCaretOffsetInElement(nextEditable, Math.min(savedOffset, block.text.length));
       }
+    }
+  }
+
+  private centerElementInViewport(el: HTMLElement): void {
+    const containerRect = this.scrollContainer.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    const delta = elRect.top + elRect.height / 2 - (containerRect.top + containerRect.height * 0.45);
+    if (Math.abs(delta) > 24) {
+      this.scrollContainer.scrollBy({ top: delta, behavior: 'smooth' });
     }
   }
 
@@ -642,7 +1077,6 @@ export class VirtualDocumentRenderer {
 
     const plainText = editable.textContent ?? '';
 
-    // 1. Check Markdown block triggers (e.g., "# ", "- ", "```", "---")
     const mdTrigger = detectMarkdownBlockTrigger(block.type, plainText);
     if (mdTrigger) {
       if (mdTrigger.newType === 'divider') {
@@ -664,19 +1098,23 @@ export class VirtualDocumentRenderer {
       return;
     }
 
-    // 2. Check inline Markdown shortcuts (**bold**, *italic*, `code`, ==highlight==)
     if (block.type !== 'code-block') {
       tryInlineMarkdownConversion(editable);
+    } else {
+      this.syntaxHighlighter.schedule();
     }
 
-    // 3. Persist block content to store in O(1)
     const content = block.type === 'code-block' ? editable.textContent ?? '' : editable.innerHTML;
     const updatedText = editable.textContent ?? '';
     this.store.updateBlockContent(blockId, content, updatedText, false);
 
-    // 4. Slash command detection
     if (block.type !== 'code-block') {
       this.evaluateSlashTrigger(blockId, editable);
+    }
+
+    if (this.typewriterMode) {
+      const wrapper = this.mountedNodes.get(blockId);
+      if (wrapper) this.centerElementInViewport(wrapper);
     }
 
     this.callbacks.onLatencySample(performance.now() - t0);
@@ -739,6 +1177,12 @@ export class VirtualDocumentRenderer {
 
     this.closeSlashMenu();
 
+    if (targetType === 'image') {
+      this.store.updateBlockContent(blockId, escapeHtml(cleanedText), cleanedText, true);
+      this.callbacks.onRequestImagePick(blockId);
+      return;
+    }
+
     if (targetType === 'divider') {
       if (cleanedText.length > 0) {
         this.store.updateBlockContent(blockId, escapeHtml(cleanedText), cleanedText, true);
@@ -758,7 +1202,9 @@ export class VirtualDocumentRenderer {
       targetType,
       targetType === 'code-block' ? cleanedText : escapeHtml(cleanedText)
     );
-    this.focusBlock(blockId, cleanedText.length);
+    if (targetType !== 'table') {
+      this.focusBlock(blockId, cleanedText.length);
+    }
   }
 
   private handleBlockKeyDown(
@@ -778,7 +1224,19 @@ export class VirtualDocumentRenderer {
     if (!block) return;
     const mod = e.metaKey || e.ctrlKey;
 
-    // Inline formatting shortcuts
+    // Move block up/down with Ctrl/Cmd+Shift+ArrowUp/Down
+    if (mod && e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault();
+      const idx = this.store.getBlockIndex(blockId);
+      const targetIdx = e.key === 'ArrowUp' ? idx - 1 : idx + 1;
+      if (targetIdx >= 0 && targetIdx < this.store.getBlockCount()) {
+        const offset = getCaretOffsetInElement(editable).offset;
+        this.store.moveBlock(idx, targetIdx);
+        this.focusBlock(blockId, offset);
+      }
+      return;
+    }
+
     if (mod && !e.altKey) {
       const key = e.key.toLowerCase();
       if (key === 'b') {
@@ -816,14 +1274,12 @@ export class VirtualDocumentRenderer {
       }
     }
 
-    // Tab inside code block inserts 2 spaces
     if (e.key === 'Tab' && block.type === 'code-block') {
       e.preventDefault();
       document.execCommand('insertText', false, '  ');
       return;
     }
 
-    // Enter handling
     if (e.key === 'Enter') {
       if (block.type === 'code-block') {
         if (mod || e.shiftKey) {
@@ -842,7 +1298,11 @@ export class VirtualDocumentRenderer {
       this.closeSlashMenu();
 
       if (
-        (block.type === 'bullet-list' || block.type === 'numbered-list' || block.type === 'blockquote') &&
+        (block.type === 'bullet-list' ||
+          block.type === 'numbered-list' ||
+          block.type === 'todo' ||
+          block.type === 'blockquote' ||
+          block.type === 'callout') &&
         (editable.textContent ?? '').trim() === ''
       ) {
         this.store.setBlockType(blockId, 'paragraph', '');
@@ -858,7 +1318,9 @@ export class VirtualDocumentRenderer {
       this.store.updateBlockContent(blockId, cleanBefore, editable.textContent ?? '', false);
 
       const nextType: BlockType =
-        block.type === 'bullet-list' || block.type === 'numbered-list'
+        block.type === 'bullet-list' ||
+        block.type === 'numbered-list' ||
+        block.type === 'todo'
           ? block.type
           : 'paragraph';
 
@@ -868,13 +1330,16 @@ export class VirtualDocumentRenderer {
       return;
     }
 
-    // Backspace at start of block
     if (e.key === 'Backspace') {
       const caret = getCaretOffsetInElement(editable);
       if (caret.isAtStart) {
         if (block.type !== 'paragraph') {
           e.preventDefault();
-          this.store.setBlockType(blockId, 'paragraph', block.type === 'code-block' ? escapeHtml(block.text) : block.html);
+          this.store.setBlockType(
+            blockId,
+            'paragraph',
+            block.type === 'code-block' ? escapeHtml(block.text) : block.html
+          );
           this.focusBlock(blockId, 0);
           return;
         }
@@ -883,7 +1348,7 @@ export class VirtualDocumentRenderer {
           e.preventDefault();
           const prev = this.store.getBlockAt(idx - 1);
           if (!prev) return;
-          if (prev.type === 'divider') {
+          if (prev.type === 'divider' || prev.type === 'image' || prev.type === 'table') {
             this.store.deleteBlock(prev.id);
             this.focusBlock(blockId, 0);
             return;
@@ -901,18 +1366,17 @@ export class VirtualDocumentRenderer {
       return;
     }
 
-    // Cross-block vertical arrow navigation
     if (e.key === 'ArrowUp' && !e.shiftKey) {
       if (isCaretOnFirstVisualLine(editable)) {
         const idx = this.store.getBlockIndex(blockId);
         if (idx > 0) {
-          e.preventDefault();
           let targetIdx = idx - 1;
-          while (targetIdx > 0 && this.store.getBlockAt(targetIdx)?.type === 'divider') {
+          while (targetIdx >= 0 && !this.isTextFocusable(this.store.getBlockAt(targetIdx))) {
             targetIdx--;
           }
           const prev = this.store.getBlockAt(targetIdx);
-          if (prev && prev.type !== 'divider') {
+          if (prev && this.isTextFocusable(prev)) {
+            e.preventDefault();
             this.focusBlock(prev.id, prev.text.length);
           }
         }
@@ -921,16 +1385,16 @@ export class VirtualDocumentRenderer {
       if (isCaretOnLastVisualLine(editable)) {
         const idx = this.store.getBlockIndex(blockId);
         if (idx < this.store.getBlockCount() - 1) {
-          e.preventDefault();
           let targetIdx = idx + 1;
           while (
-            targetIdx < this.store.getBlockCount() - 1 &&
-            this.store.getBlockAt(targetIdx)?.type === 'divider'
+            targetIdx < this.store.getBlockCount() &&
+            !this.isTextFocusable(this.store.getBlockAt(targetIdx))
           ) {
             targetIdx++;
           }
           const next = this.store.getBlockAt(targetIdx);
-          if (next && next.type !== 'divider') {
+          if (next && this.isTextFocusable(next)) {
+            e.preventDefault();
             this.focusBlock(next.id, 0);
           }
         }
@@ -938,11 +1402,30 @@ export class VirtualDocumentRenderer {
     }
   }
 
+  private isTextFocusable(block?: Block): boolean {
+    if (!block) return false;
+    return block.type !== 'divider' && block.type !== 'image' && block.type !== 'table';
+  }
+
   private handleBlockPaste(
     e: ClipboardEvent,
     blockId: string,
     editable: HTMLElement
   ): void {
+    const items = e.clipboardData?.items;
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.startsWith('image/')) {
+          const blob = items[i].getAsFile();
+          if (blob) {
+            e.preventDefault();
+            void this.insertImageBlobAfter(blockId, blob, true);
+            return;
+          }
+        }
+      }
+    }
+
     e.preventDefault();
     const block = this.store.getBlockById(blockId);
     if (!block) return;
@@ -954,7 +1437,9 @@ export class VirtualDocumentRenderer {
       return;
     }
 
-    const lines = plain.split(/\r?\n/).filter((l, i, arr) => l.length > 0 || (i > 0 && i < arr.length - 1));
+    const lines = plain
+      .split(/\r?\n/)
+      .filter((l, i, arr) => l.length > 0 || (i > 0 && i < arr.length - 1));
     if (lines.length <= 1) {
       const html = e.clipboardData?.getData('text/html');
       const clean = html ? sanitizeInlineHtml(html) : escapeHtml(plain);
@@ -963,7 +1448,6 @@ export class VirtualDocumentRenderer {
       return;
     }
 
-    // Multi-paragraph paste: split into clean blocks
     document.execCommand('insertText', false, lines[0]);
     this.handleBlockInput(blockId, editable);
 
@@ -1008,7 +1492,7 @@ export class VirtualDocumentRenderer {
 
     if (shouldFocus) {
       const block = this.store.getBlockAt(clamped);
-      if (block) {
+      if (block && this.isTextFocusable(block)) {
         window.setTimeout(() => this.focusBlock(block.id, 0), 180);
       }
     }
@@ -1018,7 +1502,6 @@ export class VirtualDocumentRenderer {
     const idx = this.store.getBlockIndex(blockId);
     if (idx < 0) return;
 
-    // Ensure target block is inside the virtualized viewport
     let wrapper = this.mountedNodes.get(blockId);
     if (!wrapper) {
       const targetTop = Math.max(0, this.pageSurface.offsetTop + this.offsets[idx] - 140);

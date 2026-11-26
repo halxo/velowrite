@@ -5,19 +5,25 @@ import {
   DocumentStore,
   generateBenchmarkDocument,
 } from './model/documentStore';
+import { generateId } from './model/sanitize';
 import {
   DEFAULT_PREFERENCES,
+  type DocumentSnapshot,
   type DocumentSummary,
   type FontPreset,
+  type LineSpacingPreset,
   type MarginPreset,
+  type PageSizePreset,
   type ThemeMode,
   type UserPreferences,
 } from './model/types';
 import { VeloStorage } from './storage/indexedDB';
 import {
+  documentToMarkdown,
   exportToDocx,
   exportToJson,
   exportToMarkdown,
+  markdownToDocument,
   parseImportedJson,
 } from './storage/exporters';
 import { VirtualDocumentRenderer } from './editor/virtualRenderer';
@@ -26,6 +32,8 @@ import { SlashCommandMenu } from './ui/slashMenu';
 import { OutlineSidebar } from './ui/outlineSidebar';
 import { CommandPalette, type PaletteCommand } from './ui/commandPalette';
 import { StatusFooter } from './ui/statusFooter';
+import { FindReplaceBar } from './ui/findReplaceBar';
+import { SnapshotModal } from './ui/snapshotModal';
 import { UpdateBanner } from './ui/updateBanner';
 import { ICONS } from './ui/icons';
 
@@ -41,9 +49,14 @@ class VeloWriteApp {
   private sidebar!: OutlineSidebar;
   private palette!: CommandPalette;
   private footer!: StatusFooter;
+  private findBar!: FindReplaceBar;
+  private snapshotModal!: SnapshotModal;
   private updateBanner?: UpdateBanner;
+
   private manualUpdateCheck = false;
   private desktopVersion: string | null = null;
+  private currentDiskFilePath: string | null = null;
+  private pendingImageBlockId: string | null = null;
 
   private topbarEl!: HTMLElement;
   private titleInput!: HTMLInputElement;
@@ -51,6 +64,7 @@ class VeloWriteApp {
   private saveLabelEl!: HTMLElement;
   private pageModeBtn!: HTMLButtonElement;
   private importInput!: HTMLInputElement;
+  private imageInput!: HTMLInputElement;
   private dimTimer: number | null = null;
 
   async init(): Promise<void> {
@@ -60,14 +74,15 @@ class VeloWriteApp {
     this.saveLabelEl = this.saveStatusEl.querySelector('.vw-save-label') as HTMLElement;
     this.pageModeBtn = document.getElementById('vw-btn-page-mode') as HTMLButtonElement;
     this.importInput = document.getElementById('vw-import-json-input') as HTMLInputElement;
+    this.imageInput = document.getElementById('vw-pick-image-input') as HTMLInputElement;
 
     const sidebarToggleBtn = document.getElementById('vw-btn-toggle-sidebar') as HTMLButtonElement;
     sidebarToggleBtn.innerHTML = ICONS.sidebar;
 
-    // Load preferences and persisted document from IndexedDB
     try {
       this.prefs = await this.storage.getPreferences();
       this.applyTheme(this.prefs.theme, false);
+      this.applyFocusMode(this.prefs.focusMode, false);
 
       const summaries = await this.storage.listDocumentSummaries();
       const targetId = this.prefs.lastDocumentId ?? summaries[0]?.id ?? null;
@@ -88,6 +103,10 @@ class VeloWriteApp {
     this.initComponents();
     this.bindGlobalEvents(sidebarToggleBtn);
     this.syncChromeFromStore();
+
+    if (this.prefs.syncFolderPath && window.velowriteDesktop) {
+      void this.pullFromSyncFolder();
+    }
   }
 
   private initComponents(): void {
@@ -96,7 +115,8 @@ class VeloWriteApp {
     const sidebarEl = document.getElementById('vw-sidebar') as HTMLElement;
     const footerEl = document.getElementById('vw-footer') as HTMLElement;
 
-    this.footer = new StatusFooter(footerEl);
+    this.footer = new StatusFooter(footerEl, () => this.promptWordGoal());
+    this.footer.setWordGoal(this.prefs.dailyWordGoal);
 
     this.sidebar = new OutlineSidebar(sidebarEl, {
       onSelectHeading: (blockIndex) => {
@@ -125,13 +145,43 @@ class VeloWriteApp {
       () => this.renderer.closeSlashMenu()
     );
 
-    this.renderer = new VirtualDocumentRenderer(this.store, scrollContainer, pageSurface, {
-      onSlashStateChange: (state) => this.slashMenu.update(state),
-      onSlashKeyDown: (e) => this.slashMenu.handleKeyDown(e),
-      onSelectionToolbarChange: (state) => this.selectionToolbar.update(state),
-      onLatencySample: (ms) => this.footer.updateLatency(ms),
-      onActiveHeadingChange: (id) => this.sidebar.setActiveHeading(id),
-      onTypingActivity: () => this.handleTypingActivity(),
+    this.renderer = new VirtualDocumentRenderer(
+      this.store,
+      this.storage,
+      scrollContainer,
+      pageSurface,
+      {
+        onSlashStateChange: (state) => this.slashMenu.update(state),
+        onSlashKeyDown: (e) => this.slashMenu.handleKeyDown(e),
+        onSelectionToolbarChange: (state) => this.selectionToolbar.update(state),
+        onLatencySample: (ms) => this.footer.updateLatency(ms),
+        onActiveHeadingChange: (id) => this.sidebar.setActiveHeading(id),
+        onTypingActivity: () => this.handleTypingActivity(),
+        onRequestImagePick: (blockId) => {
+          this.pendingImageBlockId = blockId;
+          this.imageInput.click();
+        },
+      }
+    );
+    this.renderer.setTypewriterMode(this.prefs.typewriterMode);
+
+    this.findBar = new FindReplaceBar(this.store, {
+      onJumpToBlock: (blockIndex) => this.renderer.scrollToBlockIndex(blockIndex, false),
+      onRefreshHighlights: (q, cs, rx) => this.renderer.setSearchHighlights(q, cs, rx),
+    });
+
+    this.snapshotModal = new SnapshotModal({
+      onCreateSnapshot: async (label) => {
+        await this.createSnapshot(label);
+      },
+      onRestoreSnapshot: async (snap) => {
+        await this.restoreSnapshot(snap);
+      },
+      onDeleteSnapshot: async (id) => {
+        await this.storage.deleteSnapshot(id);
+        const list = await this.storage.listSnapshots(this.store.getDocument().id);
+        this.snapshotModal.setSnapshots(list);
+      },
     });
 
     this.palette = new CommandPalette(() => this.buildPaletteCommands());
@@ -157,6 +207,14 @@ class VeloWriteApp {
         state === 'saving' ? 'Saving…' : state === 'error' ? 'Save error' : 'Saved';
       if (state === 'saved') {
         void this.refreshRecentDocs();
+        if (this.prefs.syncFolderPath && window.velowriteDesktop) {
+          const doc = this.store.getDocument();
+          void window.velowriteDesktop.syncWriteDoc({
+            folderPath: this.prefs.syncFolderPath,
+            docId: doc.id,
+            json: JSON.stringify(doc),
+          });
+        }
       }
     });
 
@@ -168,6 +226,7 @@ class VeloWriteApp {
         ev.kind === 'block-type' ||
         ev.kind === 'block-insert' ||
         ev.kind === 'block-delete' ||
+        ev.kind === 'block-move' ||
         ev.kind === 'block-replace-all' ||
         ev.kind === 'block-content'
       ) {
@@ -193,7 +252,6 @@ class VeloWriteApp {
 
   private bindGlobalEvents(sidebarToggleBtn: HTMLButtonElement): void {
     sidebarToggleBtn.addEventListener('click', () => this.toggleSidebar());
-
     this.pageModeBtn.addEventListener('click', () => this.togglePageMode());
 
     document
@@ -217,29 +275,42 @@ class VeloWriteApp {
       this.importInput.value = '';
       if (!file) return;
       const text = await file.text();
-      const imported = parseImportedJson(text);
-      if (imported) {
-        await this.storage.flushPendingSave();
-        this.store.loadDocument(imported);
-        await this.storage.saveDocumentImmediate(imported);
-        await this.saveLastDocPref(imported.id);
-        await this.refreshRecentDocs();
-      }
+      await this.loadImportedText(file.name, text);
     });
 
-    // Global keyboard shortcuts
+    this.imageInput.addEventListener('change', async () => {
+      const file = this.imageInput.files?.[0];
+      const blockId = this.pendingImageBlockId;
+      this.imageInput.value = '';
+      this.pendingImageBlockId = null;
+      if (!file || !blockId) return;
+      await this.renderer.insertImageBlobAfter(blockId, file, true);
+    });
+
     window.addEventListener('keydown', (e) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.key.toLowerCase() === 'k') {
+      const key = e.key.toLowerCase();
+      if (mod && key === 'k') {
         e.preventDefault();
         this.palette.toggle();
       } else if (mod && e.key === '\\') {
         e.preventDefault();
         this.toggleSidebar();
+      } else if (mod && key === 'f') {
+        e.preventDefault();
+        this.findBar.open(false);
+      } else if (mod && key === 'h') {
+        e.preventDefault();
+        this.findBar.open(true);
+      } else if (mod && key === 'o') {
+        e.preventDefault();
+        void this.openFromDisk();
+      } else if (mod && key === 's') {
+        e.preventDefault();
+        void this.saveToDisk(e.shiftKey);
       }
     });
 
-    // Restore topbar opacity on mouse movement
     window.addEventListener(
       'mousemove',
       () => {
@@ -250,10 +321,148 @@ class VeloWriteApp {
       { passive: true }
     );
 
-    // Flush any pending IndexedDB autosave before tab closes
     window.addEventListener('beforeunload', () => {
       void this.storage.flushPendingSave();
     });
+  }
+
+  private async loadImportedText(fileName: string, content: string): Promise<void> {
+    const doc = fileName.toLowerCase().endsWith('.json')
+      ? parseImportedJson(content)
+      : markdownToDocument(content, fileName);
+    if (!doc) return;
+    await this.storage.flushPendingSave();
+    this.store.loadDocument(doc);
+    await this.storage.saveDocumentImmediate(doc);
+    await this.saveLastDocPref(doc.id);
+    await this.refreshRecentDocs();
+    this.syncChromeFromStore();
+  }
+
+  private async openFromDisk(): Promise<void> {
+    if (window.velowriteDesktop) {
+      const result = await window.velowriteDesktop.openFile();
+      if (!result) return;
+      this.currentDiskFilePath = result.filePath;
+      await this.loadImportedText(result.fileName, result.content);
+      return;
+    }
+    this.importInput.click();
+  }
+
+  private async saveToDisk(saveAs = false): Promise<void> {
+    const doc = this.store.getDocument();
+    if (window.velowriteDesktop) {
+      const res = await window.velowriteDesktop.saveFile({
+        filePath: saveAs ? null : this.currentDiskFilePath,
+        defaultName: `${(doc.title || 'document').replace(/[^a-z0-9\-_\s]/gi, '').trim() || 'document'}.md`,
+        markdownContent: documentToMarkdown(doc),
+        jsonContent: JSON.stringify(doc, null, 2),
+      });
+      if (!res.canceled && res.filePath) {
+        this.currentDiskFilePath = res.filePath;
+      }
+      return;
+    }
+    exportToMarkdown(doc);
+  }
+
+  private async exportPdf(): Promise<void> {
+    const doc = this.store.getDocument();
+    if (window.velowriteDesktop) {
+      await window.velowriteDesktop.exportPdf({
+        defaultName: `${(doc.title || 'document').replace(/[^a-z0-9\-_\s]/gi, '').trim() || 'document'}.pdf`,
+        pageSize: doc.settings.pageSize ?? 'letter',
+      });
+      return;
+    }
+    window.print();
+  }
+
+  private async openSnapshotModal(): Promise<void> {
+    const doc = this.store.getDocument();
+    const list = await this.storage.listSnapshots(doc.id);
+    const currentPlain = doc.blocks.map((b) => b.text).filter(Boolean).join('\n');
+    this.snapshotModal.open(list, currentPlain);
+  }
+
+  private async createSnapshot(label: string): Promise<void> {
+    const doc = this.store.getDocument();
+    const snap: DocumentSnapshot = {
+      id: generateId(),
+      documentId: doc.id,
+      label,
+      title: doc.title,
+      blocks: doc.blocks.map((b) => ({
+        ...b,
+        tableData: b.tableData ? b.tableData.map((r) => [...r]) : undefined,
+      })),
+      wordCount: this.store.getStats().words,
+      createdAt: Date.now(),
+    };
+    await this.storage.saveSnapshot(snap);
+    const list = await this.storage.listSnapshots(doc.id);
+    this.snapshotModal.setSnapshots(list);
+  }
+
+  private async restoreSnapshot(snap: DocumentSnapshot): Promise<void> {
+    const current = this.store.getDocument();
+    await this.createSnapshot(`Auto-backup before restoring "${snap.label}"`);
+    this.store.loadDocument({
+      ...current,
+      title: snap.title,
+      blocks: snap.blocks.map((b) => ({ ...b })),
+      updatedAt: Date.now(),
+    });
+    await this.storage.saveDocumentImmediate(this.store.getDocument());
+  }
+
+  private async configureSyncFolder(): Promise<void> {
+    if (!window.velowriteDesktop) return;
+    const folder = await window.velowriteDesktop.chooseSyncFolder();
+    if (!folder) return;
+    this.prefs.syncFolderPath = folder;
+    await this.storage.savePreferences(this.prefs);
+    const doc = this.store.getDocument();
+    await window.velowriteDesktop.syncWriteDoc({
+      folderPath: folder,
+      docId: doc.id,
+      json: JSON.stringify(doc),
+    });
+    await this.pullFromSyncFolder();
+  }
+
+  private async pullFromSyncFolder(): Promise<void> {
+    if (!this.prefs.syncFolderPath || !window.velowriteDesktop) return;
+    const rawDocs = await window.velowriteDesktop.syncReadAll({
+      folderPath: this.prefs.syncFolderPath,
+    });
+    let changed = false;
+    for (const raw of rawDocs) {
+      const parsed = parseImportedJson(raw);
+      if (!parsed) continue;
+      const local = await this.storage.getDocument(parsed.id);
+      if (!local || parsed.updatedAt > local.updatedAt) {
+        await this.storage.saveDocumentImmediate(parsed);
+        if (parsed.id === this.store.getDocument().id) {
+          this.store.loadDocument(parsed);
+        }
+        changed = true;
+      }
+    }
+    if (changed) {
+      await this.refreshRecentDocs();
+    }
+  }
+
+  private promptWordGoal(): void {
+    const current = this.prefs.dailyWordGoal > 0 ? String(this.prefs.dailyWordGoal) : '1000';
+    const input = window.prompt('Set session word goal (enter 0 to hide):', current);
+    if (input === null) return;
+    const parsed = Math.max(0, Math.floor(Number(input) || 0));
+    this.prefs.dailyWordGoal = parsed;
+    this.footer.setWordGoal(parsed);
+    void this.storage.savePreferences(this.prefs);
   }
 
   private handleTypingActivity(): void {
@@ -308,12 +517,34 @@ class VeloWriteApp {
     this.store.updateSettings({ font });
   }
 
+  private setLineSpacing(lineSpacing: LineSpacingPreset): void {
+    this.store.updateSettings({ lineSpacing });
+  }
+
+  private setPageSize(pageSize: PageSizePreset): void {
+    this.store.updateSettings({ pageSize });
+  }
+
   private applyTheme(theme: ThemeMode, persist = true): void {
     this.prefs.theme = theme;
     document.documentElement.dataset.theme = theme;
     if (persist) {
       void this.storage.savePreferences(this.prefs);
     }
+  }
+
+  private applyFocusMode(enabled: boolean, persist = true): void {
+    this.prefs.focusMode = enabled;
+    document.body.classList.toggle('vw-focus-mode', enabled);
+    if (persist) {
+      void this.storage.savePreferences(this.prefs);
+    }
+  }
+
+  private toggleTypewriterMode(): void {
+    this.prefs.typewriterMode = !this.prefs.typewriterMode;
+    this.renderer.setTypewriterMode(this.prefs.typewriterMode);
+    void this.storage.savePreferences(this.prefs);
   }
 
   private async saveLastDocPref(docId: string): Promise<void> {
@@ -328,6 +559,7 @@ class VeloWriteApp {
 
   private async createNewDocument(): Promise<void> {
     await this.storage.flushPendingSave();
+    this.currentDiskFilePath = null;
     const doc = createBlankDocument('Untitled Document');
     this.store.loadDocument(doc);
     await this.storage.saveDocumentImmediate(doc);
@@ -341,6 +573,7 @@ class VeloWriteApp {
   private async openDocument(docId: string): Promise<void> {
     if (docId === this.store.getDocument().id) return;
     await this.storage.flushPendingSave();
+    this.currentDiskFilePath = null;
     const doc = await this.storage.getDocument(docId);
     if (!doc) return;
     this.store.loadDocument(doc);
@@ -368,6 +601,7 @@ class VeloWriteApp {
 
   private async loadBenchmarkDocument(): Promise<void> {
     await this.storage.flushPendingSave();
+    this.currentDiskFilePath = null;
     const bench = generateBenchmarkDocument();
     this.store.loadDocument(bench);
     await this.storage.saveDocumentImmediate(bench);
@@ -390,6 +624,47 @@ class VeloWriteApp {
         run: () => void this.createNewDocument(),
       },
       {
+        id: 'open-disk',
+        section: 'Actions',
+        label: 'Open File from Disk (.md, .txt, .json)',
+        subtitle: 'Load a local Markdown or JSON file directly into VeloWrite',
+        shortcut: '⌘O',
+        icon: ICONS.folder,
+        keywords: ['open', 'import', 'disk', 'markdown'],
+        run: () => void this.openFromDisk(),
+      },
+      {
+        id: 'save-disk',
+        section: 'Actions',
+        label: 'Save File to Disk',
+        subtitle: this.currentDiskFilePath
+          ? `Save to ${this.currentDiskFilePath}`
+          : 'Save document to disk as Markdown or JSON',
+        shortcut: '⌘S',
+        icon: ICONS.download,
+        keywords: ['save', 'disk', 'file'],
+        run: () => void this.saveToDisk(false),
+      },
+      {
+        id: 'find-replace',
+        section: 'Actions',
+        label: 'Find & Replace',
+        subtitle: 'Search across the entire manuscript in milliseconds',
+        shortcut: '⌘F',
+        icon: ICONS.search,
+        keywords: ['find', 'search', 'replace', 'regex'],
+        run: () => this.findBar.open(true),
+      },
+      {
+        id: 'snapshots',
+        section: 'Actions',
+        label: 'Version Snapshots & Visual Diff',
+        subtitle: 'Save a local checkpoint or compare revisions word-by-word',
+        icon: ICONS.history,
+        keywords: ['history', 'snapshot', 'version', 'diff', 'restore'],
+        run: () => void this.openSnapshotModal(),
+      },
+      {
         id: 'toggle-sidebar',
         section: 'Actions',
         label: this.prefs.sidebarOpen ? 'Hide Outline Sidebar' : 'Show Outline Sidebar',
@@ -398,6 +673,36 @@ class VeloWriteApp {
         icon: ICONS.sidebar,
         keywords: ['outline', 'panel', 'navigation'],
         run: () => this.toggleSidebar(),
+      },
+      {
+        id: 'toggle-focus',
+        section: 'Actions',
+        label: this.prefs.focusMode ? 'Disable Focus Mode' : 'Enable Focus Mode',
+        subtitle: 'Dim surrounding paragraphs to stay locked on the active block',
+        icon: ICONS.bolt,
+        keywords: ['focus', 'zen', 'distraction'],
+        run: () => this.applyFocusMode(!this.prefs.focusMode),
+      },
+      {
+        id: 'toggle-typewriter',
+        section: 'Actions',
+        label: this.prefs.typewriterMode ? 'Disable Typewriter Mode' : 'Enable Typewriter Mode',
+        subtitle: 'Keep the active writing line vertically centered while typing',
+        icon: ICONS.bolt,
+        keywords: ['typewriter', 'center', 'scroll'],
+        run: () => this.toggleTypewriterMode(),
+      },
+      {
+        id: 'word-goal',
+        section: 'Actions',
+        label: 'Set Session Word Goal',
+        subtitle:
+          this.prefs.dailyWordGoal > 0
+            ? `Current goal: ${this.prefs.dailyWordGoal.toLocaleString()} words`
+            : 'Track writing progress in the footer',
+        icon: ICONS.todo,
+        keywords: ['goal', 'target', 'words', 'progress'],
+        run: () => this.promptWordGoal(),
       },
       {
         id: 'toggle-page-mode',
@@ -420,17 +725,19 @@ class VeloWriteApp {
         keywords: ['100', 'page', 'stress', 'benchmark', 'performance', 'fps'],
         run: () => void this.loadBenchmarkDocument(),
       },
-      {
-        id: 'import-json',
-        section: 'Actions',
-        label: 'Import VeloWrite JSON',
-        subtitle: 'Load a previously exported .json document into IndexedDB',
-        icon: ICONS.download,
-        keywords: ['open', 'upload', 'json'],
-        run: () => this.importInput.click(),
-      },
       ...(window.velowriteDesktop
         ? [
+            {
+              id: 'sync-folder',
+              section: 'Actions' as const,
+              label: 'Configure Folder Sync (iCloud / OneDrive / Dropbox)',
+              subtitle: this.prefs.syncFolderPath
+                ? `Syncing to: ${this.prefs.syncFolderPath}`
+                : 'Mirror documents atomically to a local cloud-synced folder',
+              icon: ICONS.folder,
+              keywords: ['sync', 'folder', 'icloud', 'onedrive', 'dropbox', 'backup'],
+              run: () => void this.configureSyncFolder(),
+            },
             {
               id: 'check-updates',
               section: 'Actions' as const,
@@ -450,10 +757,19 @@ class VeloWriteApp {
 
       // Export
       {
+        id: 'export-pdf',
+        section: 'Export',
+        label: 'Export as PDF (.pdf)',
+        subtitle: 'Clean paginated PDF preserving margins and typography',
+        icon: ICONS.download,
+        keywords: ['pdf', 'print', 'export'],
+        run: () => void this.exportPdf(),
+      },
+      {
         id: 'export-md',
         section: 'Export',
         label: 'Export as Markdown (.md)',
-        subtitle: 'Clean CommonMark with headings, lists, quotes, and code blocks',
+        subtitle: 'Clean CommonMark with headings, checklists, tables, and code blocks',
         icon: ICONS.download,
         keywords: ['markdown', 'md', 'download', 'save'],
         run: () => exportToMarkdown(this.store.getDocument()),
@@ -511,7 +827,7 @@ class VeloWriteApp {
         label: 'Margins: Narrow',
         subtitle: 'Wider text measure for dense technical documents',
         icon: ICONS.paginated,
-        keywords: ['margins', 'narrow', 'wide text'],
+        keywords: ['margins', 'narrow'],
         run: () => this.setMargins('narrow'),
       },
       {
@@ -520,7 +836,7 @@ class VeloWriteApp {
         label: 'Margins: Normal',
         subtitle: 'Balanced editorial margins (default)',
         icon: ICONS.paginated,
-        keywords: ['margins', 'normal', 'default'],
+        keywords: ['margins', 'normal'],
         run: () => this.setMargins('normal'),
       },
       {
@@ -529,7 +845,7 @@ class VeloWriteApp {
         label: 'Margins: Wide',
         subtitle: 'Focused book-style column width',
         icon: ICONS.paginated,
-        keywords: ['margins', 'wide', 'focused'],
+        keywords: ['margins', 'wide'],
         run: () => this.setMargins('wide'),
       },
       {
@@ -558,6 +874,46 @@ class VeloWriteApp {
         icon: ICONS.code,
         keywords: ['font', 'mono', 'code', 'typography'],
         run: () => this.setFont('mono'),
+      },
+      {
+        id: 'spacing-compact',
+        section: 'Appearance',
+        label: 'Line Spacing: Compact (1.5)',
+        icon: ICONS.continuous,
+        keywords: ['spacing', 'line height', 'compact'],
+        run: () => this.setLineSpacing('compact'),
+      },
+      {
+        id: 'spacing-normal',
+        section: 'Appearance',
+        label: 'Line Spacing: Normal (1.72)',
+        icon: ICONS.continuous,
+        keywords: ['spacing', 'line height', 'normal'],
+        run: () => this.setLineSpacing('normal'),
+      },
+      {
+        id: 'spacing-relaxed',
+        section: 'Appearance',
+        label: 'Line Spacing: Relaxed (1.95)',
+        icon: ICONS.continuous,
+        keywords: ['spacing', 'line height', 'relaxed'],
+        run: () => this.setLineSpacing('relaxed'),
+      },
+      {
+        id: 'pagesize-letter',
+        section: 'Appearance',
+        label: 'Page Size: US Letter',
+        icon: ICONS.paginated,
+        keywords: ['page size', 'letter'],
+        run: () => this.setPageSize('letter'),
+      },
+      {
+        id: 'pagesize-a4',
+        section: 'Appearance',
+        label: 'Page Size: A4',
+        icon: ICONS.paginated,
+        keywords: ['page size', 'a4'],
+        run: () => this.setPageSize('a4'),
       },
     ];
 

@@ -1,6 +1,6 @@
 import type { Block, DocumentModel } from '../model/types';
 import { createBlock } from '../model/documentStore';
-import { generateId } from '../model/sanitize';
+import { escapeHtml, generateId } from '../model/sanitize';
 
 function sanitizeFilename(title: string, ext: string): string {
   const clean = (title || 'velowrite-document')
@@ -23,7 +23,7 @@ export function triggerDownload(blob: Blob, filename: string): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/* ============================ JSON EXPORT ============================ */
+/* ============================ JSON EXPORT & IMPORT ============================ */
 
 export function exportToJson(doc: DocumentModel): void {
   const payload = JSON.stringify(doc, null, 2);
@@ -37,19 +37,170 @@ export function parseImportedJson(raw: string): DocumentModel | null {
     if (!parsed || !Array.isArray(parsed.blocks)) return null;
     const now = Date.now();
     const blocks: Block[] = parsed.blocks.map((b) =>
-      createBlock(b.type ?? 'paragraph', typeof b.html === 'string' ? b.html : b.text ?? '', b.align)
+      createBlock(
+        b.type ?? 'paragraph',
+        typeof b.html === 'string' ? b.html : b.text ?? '',
+        b.align,
+        {
+          checked: b.checked,
+          collapsed: b.collapsed,
+          toggleBody: b.toggleBody,
+          imageAssetId: b.imageAssetId,
+          imageCaption: b.imageCaption,
+          imageWidth: b.imageWidth,
+          tableData: b.tableData,
+          codeLang: b.codeLang,
+        }
+      )
     );
     return {
-      id: generateId(),
+      id: typeof parsed.id === 'string' ? parsed.id : generateId(),
       title: typeof parsed.title === 'string' ? parsed.title : 'Imported Document',
       blocks: blocks.length > 0 ? blocks : [createBlock('paragraph', '')],
-      settings: parsed.settings ?? { pageMode: 'paginated', margins: 'normal', font: 'serif' },
-      createdAt: now,
+      settings: {
+        pageMode: parsed.settings?.pageMode ?? 'paginated',
+        margins: parsed.settings?.margins ?? 'normal',
+        font: parsed.settings?.font ?? 'serif',
+        lineSpacing: parsed.settings?.lineSpacing ?? 'normal',
+        pageSize: parsed.settings?.pageSize ?? 'letter',
+      },
+      createdAt: parsed.createdAt ?? now,
       updatedAt: now,
     };
   } catch {
     return null;
   }
+}
+
+/* ========================== MARKDOWN IMPORT ========================== */
+
+function inlineMarkdownToHtml(line: string): string {
+  let out = escapeHtml(line);
+  out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
+  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>');
+  out = out.replace(/==([^=]+)==/g, '<mark>$1</mark>');
+  out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return out;
+}
+
+export function markdownToDocument(raw: string, filenameTitle = 'Imported Markdown'): DocumentModel {
+  const lines = raw.replace(/\r\n/g, '\n').split('\n');
+  const blocks: Block[] = [];
+  let inCode = false;
+  let codeLang = 'typescript';
+  let codeLines: string[] = [];
+  let derivedTitle = filenameTitle.replace(/\.(md|markdown|txt)$/i, '');
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.trim().startsWith('```')) {
+      if (!inCode) {
+        inCode = true;
+        codeLang = line.trim().slice(3).trim() || 'typescript';
+        codeLines = [];
+      } else {
+        inCode = false;
+        blocks.push(createBlock('code-block', codeLines.join('\n'), undefined, { codeLang }));
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (line.trim() === '') continue;
+
+    if (/^---+$/.test(line.trim())) {
+      blocks.push(createBlock('divider', ''));
+      continue;
+    }
+
+    if (line.startsWith('# ')) {
+      const text = line.slice(2).trim();
+      if (blocks.length === 0 && text) derivedTitle = text;
+      blocks.push(createBlock('heading1', inlineMarkdownToHtml(text)));
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      blocks.push(createBlock('heading2', inlineMarkdownToHtml(line.slice(3).trim())));
+      continue;
+    }
+    if (line.startsWith('### ')) {
+      blocks.push(createBlock('heading3', inlineMarkdownToHtml(line.slice(4).trim())));
+      continue;
+    }
+
+    const todoMatch = /^-\s\[([ xX])\]\s(.*)$/.exec(line);
+    if (todoMatch) {
+      blocks.push(
+        createBlock('todo', inlineMarkdownToHtml(todoMatch[2]), undefined, {
+          checked: todoMatch[1].toLowerCase() === 'x',
+        })
+      );
+      continue;
+    }
+
+    if (/^[-*]\s/.test(line)) {
+      blocks.push(createBlock('bullet-list', inlineMarkdownToHtml(line.slice(2))));
+      continue;
+    }
+    if (/^\d+\.\s/.test(line)) {
+      blocks.push(createBlock('numbered-list', inlineMarkdownToHtml(line.replace(/^\d+\.\s/, ''))));
+      continue;
+    }
+    if (line.startsWith('> [!')) {
+      blocks.push(createBlock('callout', inlineMarkdownToHtml(line.replace(/^>\s*\[![^\]]+\]\s*/, ''))));
+      continue;
+    }
+    if (line.startsWith('> ')) {
+      blocks.push(createBlock('blockquote', inlineMarkdownToHtml(line.slice(2))));
+      continue;
+    }
+
+    if (line.trim().startsWith('|') && line.trim().endsWith('|')) {
+      const tableRows: string[][] = [];
+      while (i < lines.length && lines[i].trim().startsWith('|')) {
+        const rowLine = lines[i].trim();
+        if (!/^\|[\s:-]+\|$/.test(rowLine.replace(/\|/g, (_m, idx, s) => (idx === 0 || idx === s.length - 1 ? '|' : '')))) {
+          const cells = rowLine
+            .slice(1, -1)
+            .split('|')
+            .map((c) => c.trim());
+          if (!cells.every((c) => /^:?-+:?$/.test(c))) {
+            tableRows.push(cells);
+          }
+        }
+        i++;
+      }
+      i--;
+      if (tableRows.length > 0) {
+        blocks.push(createBlock('table', '', undefined, { tableData: tableRows }));
+        continue;
+      }
+    }
+
+    blocks.push(createBlock('paragraph', inlineMarkdownToHtml(line)));
+  }
+
+  const now = Date.now();
+  return {
+    id: generateId(),
+    title: derivedTitle || 'Imported Document',
+    blocks: blocks.length > 0 ? blocks : [createBlock('paragraph', '')],
+    settings: {
+      pageMode: 'paginated',
+      margins: 'normal',
+      font: 'serif',
+      lineSpacing: 'normal',
+      pageSize: 'letter',
+    },
+    createdAt: now,
+    updatedAt: now,
+  };
 }
 
 /* ========================== MARKDOWN EXPORT ========================== */
@@ -138,11 +289,35 @@ export function documentToMarkdown(doc: DocumentModel): string {
         lines.push(`${orderedCounter}. ${inlineHtmlToMarkdown(b.html)}`);
         if (doc.blocks[i + 1]?.type !== 'numbered-list') lines.push('');
         break;
+      case 'todo':
+        lines.push(`- [${b.checked ? 'x' : ' '}] ${inlineHtmlToMarkdown(b.html)}`);
+        if (doc.blocks[i + 1]?.type !== 'todo') lines.push('');
+        break;
       case 'blockquote':
         lines.push(`> ${inlineHtmlToMarkdown(b.html)}`, '');
         break;
+      case 'callout':
+        lines.push(`> [!NOTE] ${inlineHtmlToMarkdown(b.html)}`, '');
+        break;
+      case 'toggle':
+        lines.push(`<details><summary>${inlineHtmlToMarkdown(b.html)}</summary>\n\n${b.toggleBody ?? ''}\n\n</details>`, '');
+        break;
       case 'code-block':
-        lines.push('```', b.text, '```', '');
+        lines.push(`\`\`\`${b.codeLang ?? ''}`, b.text, '```', '');
+        break;
+      case 'table':
+        if (b.tableData && b.tableData.length > 0) {
+          const header = b.tableData[0];
+          lines.push(`| ${header.join(' | ')} |`);
+          lines.push(`| ${header.map(() => '---').join(' | ')} |`);
+          for (let r = 1; r < b.tableData.length; r++) {
+            lines.push(`| ${b.tableData[r].join(' | ')} |`);
+          }
+          lines.push('');
+        }
+        break;
+      case 'image':
+        lines.push(`![${b.imageCaption ?? 'Image'}](velowrite-asset://${b.imageAssetId ?? ''})`, '');
         break;
       case 'divider':
         lines.push('---', '');
@@ -261,11 +436,41 @@ function buildDocxXml(doc: DocumentModel): {
     return runXml;
   };
 
-  const paragraphs: string[] = [];
+  const bodyElements: string[] = [];
 
   for (let i = 0; i < doc.blocks.length; i++) {
     const block = doc.blocks[i];
     if (block.type !== 'numbered-list') orderedCounter = 0;
+
+    if (block.type === 'table' && block.tableData && block.tableData.length > 0) {
+      const rowsXml = block.tableData
+        .map(
+          (row, rIdx) =>
+            `<w:tr>${row
+              .map(
+                (cell) =>
+                  `<w:tc><w:tcPr>${
+                    rIdx === 0
+                      ? '<w:shd w:val="clear" w:color="auto" w:fill="F1F0EC"/>'
+                      : ''
+                  }</w:tcPr><w:p><w:r>${
+                    rIdx === 0 ? '<w:rPr><w:b/></w:rPr>' : ''
+                  }<w:t xml:space="preserve">${escapeXml(cell)}</w:t></w:r></w:p></w:tc>`
+              )
+              .join('')}</w:tr>`
+        )
+        .join('');
+      bodyElements.push(
+        `<w:tbl><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:color="D6D3CD"/><w:left w:val="single" w:sz="4" w:color="D6D3CD"/><w:bottom w:val="single" w:sz="4" w:color="D6D3CD"/><w:right w:val="single" w:sz="4" w:color="D6D3CD"/><w:insideH w:val="single" w:sz="4" w:color="D6D3CD"/><w:insideV w:val="single" w:sz="4" w:color="D6D3CD"/></w:tblBorders></w:tblPr>${rowsXml}</w:tbl>`
+      );
+      continue;
+    }
+
+    if (block.type === 'image') {
+      const cap = block.imageCaption ? `[Image: ${block.imageCaption}]` : '[Embedded Image]';
+      bodyElements.push(`<w:p><w:r><w:rPr><w:i/><w:color w:val="78716C"/></w:rPr><w:t>${escapeXml(cap)}</w:t></w:r></w:p>`);
+      continue;
+    }
 
     const pPrParts: string[] = [];
     if (block.align && block.align !== 'left') {
@@ -278,7 +483,7 @@ function buildDocxXml(doc: DocumentModel): {
       pPrParts.push('<w:pStyle w:val="Heading2"/>');
     } else if (block.type === 'heading3') {
       pPrParts.push('<w:pStyle w:val="Heading3"/>');
-    } else if (block.type === 'blockquote') {
+    } else if (block.type === 'blockquote' || block.type === 'callout') {
       pPrParts.push('<w:pStyle w:val="Quote"/>');
     } else if (block.type === 'code-block') {
       pPrParts.push('<w:pStyle w:val="CodeBlock"/>');
@@ -289,30 +494,38 @@ function buildDocxXml(doc: DocumentModel): {
           return `<w:r><w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New"/><w:sz w:val="20"/></w:rPr><w:t xml:space="preserve">${escapeXml(line)}</w:t>${br}</w:r>`;
         })
         .join('');
-      paragraphs.push(`<w:p><w:pPr>${pPrParts.join('')}</w:pPr>${codeRuns}</w:p>`);
+      bodyElements.push(`<w:p><w:pPr>${pPrParts.join('')}</w:pPr>${codeRuns}</w:p>`);
       continue;
     } else if (block.type === 'divider') {
-      paragraphs.push(
+      bodyElements.push(
         '<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="4" w:color="D6D3CD"/></w:pBdr></w:pPr></w:p>'
       );
       continue;
-    } else if (block.type === 'bullet-list') {
+    } else if (block.type === 'bullet-list' || block.type === 'todo') {
       pPrParts.push('<w:ind w:left="540" w:hanging="260"/>');
     } else if (block.type === 'numbered-list') {
       orderedCounter++;
       pPrParts.push('<w:ind w:left="540" w:hanging="260"/>');
     }
 
-    const prefixRun =
-      block.type === 'bullet-list'
-        ? '<w:r><w:t xml:space="preserve">•  </w:t></w:r>'
-        : block.type === 'numbered-list'
-          ? `<w:r><w:t xml:space="preserve">${orderedCounter}.  </w:t></w:r>`
-          : '';
+    let prefixRun = '';
+    if (block.type === 'bullet-list') {
+      prefixRun = '<w:r><w:t xml:space="preserve">•  </w:t></w:r>';
+    } else if (block.type === 'numbered-list') {
+      prefixRun = `<w:r><w:t xml:space="preserve">${orderedCounter}.  </w:t></w:r>`;
+    } else if (block.type === 'todo') {
+      prefixRun = `<w:r><w:t xml:space="preserve">${block.checked ? '☑' : '☐'}  </w:t></w:r>`;
+    }
 
     const runs = parseRunsFromHtml(block.html).map(renderRun).join('');
     const pPr = pPrParts.length > 0 ? `<w:pPr>${pPrParts.join('')}</w:pPr>` : '';
-    paragraphs.push(`<w:p>${pPr}${prefixRun}${runs}</w:p>`);
+    bodyElements.push(`<w:p>${pPr}${prefixRun}${runs}</w:p>`);
+
+    if (block.type === 'toggle' && block.toggleBody) {
+      bodyElements.push(
+        `<w:p><w:pPr><w:ind w:left="360"/></w:pPr><w:r><w:t xml:space="preserve">${escapeXml(block.toggleBody)}</w:t></w:r></w:p>`
+      );
+    }
   }
 
   const marginTwips =
@@ -322,12 +535,17 @@ function buildDocxXml(doc: DocumentModel): {
         ? 1800
         : 1440;
 
+  const pgSz =
+    doc.settings.pageSize === 'a4'
+      ? '<w:pgSz w:w="11906" w:h="16838"/>'
+      : '<w:pgSz w:w="12240" w:h="15840"/>';
+
   const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <w:body>
-    ${paragraphs.join('\n    ')}
+    ${bodyElements.join('\n    ')}
     <w:sectPr>
-      <w:pgSz w:w="12240" w:h="15840"/>
+      ${pgSz}
       <w:pgMar w:top="${marginTwips}" w:right="${marginTwips}" w:bottom="${marginTwips}" w:left="${marginTwips}" w:header="720" w:footer="720" w:gutter="0"/>
     </w:sectPr>
   </w:body>
@@ -400,7 +618,7 @@ const DOCX_STYLES_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 const DOCX_CONTENT_TYPES_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-officedocument.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>

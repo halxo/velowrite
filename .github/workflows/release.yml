@@ -1,4 +1,4 @@
-name: Release Windows Desktop Installer
+name: Release Desktop Installers
 
 on:
   push:
@@ -10,8 +10,18 @@ permissions:
   contents: write
 
 jobs:
-  build-windows-exe:
-    runs-on: windows-latest
+  build-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: --win --x64 --publish always
+          - os: macos-latest
+            args: --mac --universal --publish always
+          - os: ubuntu-latest
+            args: --linux --x64 --publish always
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,7 +38,7 @@ jobs:
       - name: Build web bundle
         run: npm run build
 
-      - name: Build & Publish Windows .exe Installer + Auto-Updater Metadata
+      - name: Build & Publish Desktop Installer + Auto-Updater Metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --win --publish always
+        run: npx electron-builder ${{ matrix.args }}

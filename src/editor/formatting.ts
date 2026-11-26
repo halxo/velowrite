@@ -156,9 +156,13 @@ const MD_BLOCK_TRIGGERS: Array<{ pattern: RegExp; type: BlockType }> = [
   { pattern: /^###\s(.*)$/, type: 'heading3' },
   { pattern: /^##\s(.*)$/, type: 'heading2' },
   { pattern: /^#\s(.*)$/, type: 'heading1' },
+  { pattern: /^-\s\[[\sxX]?\]\s(.*)$/, type: 'todo' },
+  { pattern: /^\[\s?\]\s(.*)$/, type: 'todo' },
   { pattern: /^[-*]\s(.*)$/, type: 'bullet-list' },
   { pattern: /^1\.\s(.*)$/, type: 'numbered-list' },
+  { pattern: /^>>\s(.*)$/, type: 'toggle' },
   { pattern: /^>\s(.*)$/, type: 'blockquote' },
+  { pattern: /^!\s(.*)$/, type: 'callout' },
 ];
 
 export function detectMarkdownBlockTrigger(

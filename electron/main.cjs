@@ -1,4 +1,5 @@
-const { app, BrowserWindow, ipcMain, Menu, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron');
+const fs = require('fs/promises');
 const path = require('path');
 const { autoUpdater } = require('electron-updater');
 
@@ -131,6 +132,111 @@ function registerIpcHandlers() {
 
   ipcMain.handle('velowrite:install-update', () => {
     autoUpdater.quitAndInstall(false, true);
+  });
+
+  /* ==================== NATIVE DISK FILE SYSTEM ==================== */
+
+  ipcMain.handle('velowrite:open-file', async () => {
+    if (!mainWindow) return null;
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Open Document',
+      properties: ['openFile'],
+      filters: [
+        { name: 'VeloWrite & Markdown', extensions: ['md', 'markdown', 'json', 'txt'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    });
+    if (res.canceled || res.filePaths.length === 0) return null;
+    const filePath = res.filePaths[0];
+    const content = await fs.readFile(filePath, 'utf8');
+    return {
+      filePath,
+      fileName: path.basename(filePath),
+      content,
+    };
+  });
+
+  ipcMain.handle('velowrite:save-file', async (_event, payload) => {
+    if (!mainWindow) return { canceled: true };
+    let targetPath = payload.filePath;
+    if (!targetPath) {
+      const res = await dialog.showSaveDialog(mainWindow, {
+        title: 'Save Document',
+        defaultPath: payload.defaultName || 'document.md',
+        filters: [
+          { name: 'Markdown', extensions: ['md'] },
+          { name: 'VeloWrite JSON', extensions: ['json'] },
+          { name: 'Plain Text', extensions: ['txt'] },
+        ],
+      });
+      if (res.canceled || !res.filePath) return { canceled: true };
+      targetPath = res.filePath;
+    }
+    const content = targetPath.endsWith('.json')
+      ? payload.jsonContent
+      : payload.markdownContent;
+    await fs.writeFile(targetPath, content, 'utf8');
+    return {
+      canceled: false,
+      filePath: targetPath,
+      fileName: path.basename(targetPath),
+    };
+  });
+
+  ipcMain.handle('velowrite:export-pdf', async (_event, payload) => {
+    if (!mainWindow) return { canceled: true };
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export PDF',
+      defaultPath: payload.defaultName || 'document.pdf',
+      filters: [{ name: 'PDF Document', extensions: ['pdf'] }],
+    });
+    if (res.canceled || !res.filePath) return { canceled: true };
+    const pdfBuffer = await mainWindow.webContents.printToPDF({
+      printBackground: true,
+      pageSize: payload.pageSize === 'a4' ? 'A4' : 'Letter',
+      margins: { top: 0.4, bottom: 0.4, left: 0.4, right: 0.4 },
+    });
+    await fs.writeFile(res.filePath, pdfBuffer);
+    return { canceled: false, filePath: res.filePath };
+  });
+
+  /* ==================== FOLDER-BACKED SYNC ==================== */
+
+  ipcMain.handle('velowrite:choose-sync-folder', async () => {
+    if (!mainWindow) return null;
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose Sync Folder (iCloud, OneDrive, Dropbox, Syncthing)',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (res.canceled || res.filePaths.length === 0) return null;
+    return res.filePaths[0];
+  });
+
+  ipcMain.handle('velowrite:sync-write-doc', async (_event, { folderPath, docId, json }) => {
+    if (!folderPath || !docId) return false;
+    const safeId = String(docId).replace(/[^a-zA-Z0-9_-]/g, '');
+    const target = path.join(folderPath, `${safeId}.velowrite.json`);
+    const tmp = `${target}.tmp`;
+    await fs.writeFile(tmp, json, 'utf8');
+    await fs.rename(tmp, target);
+    return true;
+  });
+
+  ipcMain.handle('velowrite:sync-read-all', async (_event, { folderPath }) => {
+    if (!folderPath) return [];
+    try {
+      const entries = await fs.readdir(folderPath, { withFileTypes: true });
+      const docs = [];
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name.endsWith('.velowrite.json')) {
+          const raw = await fs.readFile(path.join(folderPath, entry.name), 'utf8');
+          docs.push(raw);
+        }
+      }
+      return docs;
+    } catch {
+      return [];
+    }
   });
 }
 

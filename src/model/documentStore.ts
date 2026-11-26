@@ -5,6 +5,7 @@ import {
   type DocumentModel,
   type DocumentSettings,
   type DocumentStats,
+  type ImageWidthPreset,
   type OutlineItem,
   type TextAlign,
 } from './types';
@@ -16,13 +17,16 @@ export interface StoreChangeEvent {
     | 'block-content'
     | 'block-type'
     | 'block-align'
+    | 'block-meta'
     | 'block-insert'
     | 'block-delete'
+    | 'block-move'
     | 'block-replace-all'
     | 'title'
     | 'settings';
   blockId?: string;
   blockIndex?: number;
+  toIndex?: number;
   fromExternal?: boolean;
 }
 
@@ -39,20 +43,59 @@ const COALESCE_WINDOW_MS = 400;
 const WORDS_PER_MINUTE = 238;
 const WORDS_PER_PAGE = 480;
 
+function computeBlockStats(
+  type: BlockType,
+  text: string,
+  tableData?: string[][]
+): { wordCount: number; charCount: number } {
+  if (type === 'divider' || type === 'image') {
+    return { wordCount: 0, charCount: 0 };
+  }
+  if (type === 'table' && tableData) {
+    let words = 0;
+    let chars = 0;
+    for (let r = 0; r < tableData.length; r++) {
+      for (let c = 0; c < tableData[r].length; c++) {
+        const cell = tableData[r][c];
+        words += countWords(cell);
+        chars += cell.length;
+      }
+    }
+    return { wordCount: words, charCount: chars };
+  }
+  return { wordCount: countWords(text), charCount: text.length };
+}
+
 export function createBlock(
   type: BlockType = 'paragraph',
   html = '',
-  align?: TextAlign
+  align?: TextAlign,
+  extra?: Partial<Block>
 ): Block {
   const text = type === 'code-block' ? html : extractPlainText(html);
+  const tableData =
+    extra?.tableData ??
+    (type === 'table'
+      ? [
+          ['Column 1', 'Column 2', 'Column 3'],
+          ['', '', ''],
+          ['', '', ''],
+        ]
+      : undefined);
+  const stats = computeBlockStats(type, text, tableData);
   return {
     id: generateId(),
     type,
     html,
     text,
     align,
-    wordCount: type === 'divider' ? 0 : countWords(text),
-    charCount: type === 'divider' ? 0 : text.length,
+    ...extra,
+    tableData,
+    checked: type === 'todo' ? extra?.checked ?? false : undefined,
+    collapsed: type === 'toggle' ? extra?.collapsed ?? false : undefined,
+    toggleBody: type === 'toggle' ? extra?.toggleBody ?? '' : undefined,
+    wordCount: stats.wordCount,
+    charCount: stats.charCount,
   };
 }
 
@@ -133,14 +176,6 @@ export class DocumentStore {
     return this.outlineCache;
   }
 
-  canUndo(): boolean {
-    return this.undoStack.length > 0;
-  }
-
-  canRedo(): boolean {
-    return this.redoStack.length > 0;
-  }
-
   loadDocument(doc: DocumentModel): void {
     this.doc = {
       ...doc,
@@ -203,6 +238,13 @@ export class DocumentStore {
     this.outlineCache = outline;
   }
 
+  private cloneBlocks(blocks: Block[]): Block[] {
+    return blocks.map((b) => ({
+      ...b,
+      tableData: b.tableData ? b.tableData.map((row) => [...row]) : undefined,
+    }));
+  }
+
   private pushHistory(coalesce = false): void {
     const now = Date.now();
     if (
@@ -213,7 +255,7 @@ export class DocumentStore {
       return;
     }
     this.undoStack.push({
-      blocks: this.doc.blocks.map((b) => ({ ...b })),
+      blocks: this.cloneBlocks(this.doc.blocks),
       title: this.doc.title,
       timestamp: now,
     });
@@ -227,7 +269,7 @@ export class DocumentStore {
     const prev = this.undoStack.pop();
     if (!prev) return false;
     this.redoStack.push({
-      blocks: this.doc.blocks.map((b) => ({ ...b })),
+      blocks: this.cloneBlocks(this.doc.blocks),
       title: this.doc.title,
       timestamp: Date.now(),
     });
@@ -243,7 +285,7 @@ export class DocumentStore {
     const next = this.redoStack.pop();
     if (!next) return false;
     this.undoStack.push({
-      blocks: this.doc.blocks.map((b) => ({ ...b })),
+      blocks: this.cloneBlocks(this.doc.blocks),
       title: this.doc.title,
       timestamp: Date.now(),
     });
@@ -269,10 +311,6 @@ export class DocumentStore {
     this.emit({ kind: 'settings' });
   }
 
-  /**
-   * O(1) incremental update for typing inside a single block.
-   * Avoids scanning the rest of the document for stats or index updates.
-   */
   updateBlockContent(
     blockId: string,
     html: string,
@@ -293,16 +331,14 @@ export class DocumentStore {
           ? html
           : extractPlainText(html);
 
-    const newWords = block.type === 'divider' ? 0 : countWords(text);
-    const newChars = block.type === 'divider' ? 0 : text.length;
-
-    this.totalWords += newWords - block.wordCount;
-    this.totalChars += newChars - block.charCount;
+    const stats = computeBlockStats(block.type, text, block.tableData);
+    this.totalWords += stats.wordCount - block.wordCount;
+    this.totalChars += stats.charCount - block.charCount;
 
     block.html = html;
     block.text = text;
-    block.wordCount = newWords;
-    block.charCount = newChars;
+    block.wordCount = stats.wordCount;
+    block.charCount = stats.charCount;
     this.doc.updatedAt = Date.now();
 
     if (isHeadingType(block.type)) {
@@ -322,6 +358,10 @@ export class DocumentStore {
     });
   }
 
+  replaceAllTextInBlock(blockId: string, newHtml: string, newText: string): void {
+    this.updateBlockContent(blockId, newHtml, newText, true);
+  }
+
   setBlockType(blockId: string, newType: BlockType, newHtml?: string): void {
     const idx = this.idToIndex.get(blockId);
     if (idx === undefined) return;
@@ -332,27 +372,37 @@ export class DocumentStore {
     this.pushHistory(false);
 
     block.type = newType;
+    if (newType === 'todo' && block.checked === undefined) {
+      block.checked = false;
+    }
+    if (newType === 'toggle') {
+      block.collapsed = block.collapsed ?? false;
+      block.toggleBody = block.toggleBody ?? '';
+    }
+    if (newType === 'table' && !block.tableData) {
+      block.tableData = [
+        ['Column 1', 'Column 2', 'Column 3'],
+        ['', '', ''],
+        ['', '', ''],
+      ];
+    }
+
     if (newHtml !== undefined) {
       const text = newType === 'code-block' ? newHtml : extractPlainText(newHtml);
-      const newWords = newType === 'divider' ? 0 : countWords(text);
-      const newChars = newType === 'divider' ? 0 : text.length;
-      this.totalWords += newWords - block.wordCount;
-      this.totalChars += newChars - block.charCount;
       block.html = newHtml;
       block.text = text;
-      block.wordCount = newWords;
-      block.charCount = newChars;
-    } else if (newType === 'divider') {
-      this.totalWords -= block.wordCount;
-      this.totalChars -= block.charCount;
+    } else if (newType === 'divider' || newType === 'image' || newType === 'table') {
       block.html = '';
       block.text = '';
-      block.wordCount = 0;
-      block.charCount = 0;
     } else if (newType === 'code-block') {
       block.html = block.text;
     }
 
+    const stats = computeBlockStats(newType, block.text, block.tableData);
+    this.totalWords += stats.wordCount - block.wordCount;
+    this.totalChars += stats.charCount - block.charCount;
+    block.wordCount = stats.wordCount;
+    block.charCount = stats.charCount;
     this.doc.updatedAt = Date.now();
 
     if (wasHeading || willBeHeading) {
@@ -385,20 +435,155 @@ export class DocumentStore {
     });
   }
 
+  toggleTodoChecked(blockId: string): void {
+    const idx = this.idToIndex.get(blockId);
+    if (idx === undefined) return;
+    const block = this.doc.blocks[idx];
+    if (block.type !== 'todo') return;
+    this.pushHistory(false);
+    block.checked = !block.checked;
+    this.doc.updatedAt = Date.now();
+    this.emit({ kind: 'block-meta', blockId, blockIndex: idx, fromExternal: true });
+  }
+
+  toggleSectionCollapsed(blockId: string): void {
+    const idx = this.idToIndex.get(blockId);
+    if (idx === undefined) return;
+    const block = this.doc.blocks[idx];
+    if (block.type !== 'toggle') return;
+    block.collapsed = !block.collapsed;
+    this.doc.updatedAt = Date.now();
+    this.emit({ kind: 'block-meta', blockId, blockIndex: idx, fromExternal: true });
+  }
+
+  updateToggleBody(blockId: string, bodyText: string): void {
+    const idx = this.idToIndex.get(blockId);
+    if (idx === undefined) return;
+    const block = this.doc.blocks[idx];
+    if (block.type !== 'toggle') return;
+    this.pushHistory(true);
+    block.toggleBody = bodyText;
+    this.doc.updatedAt = Date.now();
+  }
+
+  updateCodeLanguage(blockId: string, lang: string): void {
+    const idx = this.idToIndex.get(blockId);
+    if (idx === undefined) return;
+    const block = this.doc.blocks[idx];
+    if (block.type !== 'code-block') return;
+    block.codeLang = lang;
+    this.doc.updatedAt = Date.now();
+    this.emit({ kind: 'block-meta', blockId, blockIndex: idx, fromExternal: true });
+  }
+
+  updateImageMeta(
+    blockId: string,
+    meta: { imageCaption?: string; imageWidth?: ImageWidthPreset }
+  ): void {
+    const idx = this.idToIndex.get(blockId);
+    if (idx === undefined) return;
+    const block = this.doc.blocks[idx];
+    if (block.type !== 'image') return;
+    if (meta.imageCaption !== undefined) block.imageCaption = meta.imageCaption;
+    if (meta.imageWidth !== undefined) block.imageWidth = meta.imageWidth;
+    this.doc.updatedAt = Date.now();
+    this.emit({ kind: 'block-meta', blockId, blockIndex: idx, fromExternal: true });
+  }
+
+  updateTableCell(blockId: string, row: number, col: number, value: string): void {
+    const idx = this.idToIndex.get(blockId);
+    if (idx === undefined) return;
+    const block = this.doc.blocks[idx];
+    if (block.type !== 'table' || !block.tableData) return;
+    if (!block.tableData[row] || block.tableData[row][col] === value) return;
+    this.pushHistory(true);
+    block.tableData[row][col] = value;
+    const stats = computeBlockStats('table', '', block.tableData);
+    this.totalWords += stats.wordCount - block.wordCount;
+    this.totalChars += stats.charCount - block.charCount;
+    block.wordCount = stats.wordCount;
+    block.charCount = stats.charCount;
+    this.doc.updatedAt = Date.now();
+    this.emit({ kind: 'block-content', blockId, blockIndex: idx, fromExternal: false });
+  }
+
+  mutateTableStructure(
+    blockId: string,
+    op: 'add-row' | 'remove-row' | 'add-col' | 'remove-col'
+  ): void {
+    const idx = this.idToIndex.get(blockId);
+    if (idx === undefined) return;
+    const block = this.doc.blocks[idx];
+    if (block.type !== 'table' || !block.tableData) return;
+    this.pushHistory(false);
+
+    const rows = block.tableData;
+    const cols = rows[0]?.length ?? 2;
+
+    if (op === 'add-row') {
+      rows.push(new Array(cols).fill(''));
+    } else if (op === 'remove-row' && rows.length > 1) {
+      rows.pop();
+    } else if (op === 'add-col') {
+      for (const r of rows) r.push('');
+    } else if (op === 'remove-col' && cols > 1) {
+      for (const r of rows) r.pop();
+    }
+
+    const stats = computeBlockStats('table', '', rows);
+    this.totalWords += stats.wordCount - block.wordCount;
+    this.totalChars += stats.charCount - block.charCount;
+    block.wordCount = stats.wordCount;
+    block.charCount = stats.charCount;
+    this.doc.updatedAt = Date.now();
+    this.emit({ kind: 'block-meta', blockId, blockIndex: idx, fromExternal: true });
+  }
+
+  moveBlock(fromIndex: number, toIndex: number): void {
+    if (
+      fromIndex === toIndex ||
+      fromIndex < 0 ||
+      fromIndex >= this.doc.blocks.length ||
+      toIndex < 0 ||
+      toIndex >= this.doc.blocks.length
+    ) {
+      return;
+    }
+    this.pushHistory(false);
+    const [moved] = this.doc.blocks.splice(fromIndex, 1);
+    this.doc.blocks.splice(toIndex, 0, moved);
+    this.rebuildIndexMapFrom(Math.min(fromIndex, toIndex));
+    this.rebuildOutline();
+    this.doc.updatedAt = Date.now();
+    this.emit({
+      kind: 'block-move',
+      blockId: moved.id,
+      blockIndex: fromIndex,
+      toIndex,
+      fromExternal: true,
+    });
+  }
+
   insertBlockAfter(
     afterBlockId: string,
     type: BlockType = 'paragraph',
-    html = ''
+    html = '',
+    extra?: Partial<Block>
   ): Block {
     const idx = this.idToIndex.get(afterBlockId);
     const insertAt = idx === undefined ? this.doc.blocks.length : idx + 1;
-    return this.insertBlockAt(insertAt, type, html);
+    return this.insertBlockAt(insertAt, type, html, extra);
   }
 
-  insertBlockAt(index: number, type: BlockType = 'paragraph', html = ''): Block {
+  insertBlockAt(
+    index: number,
+    type: BlockType = 'paragraph',
+    html = '',
+    extra?: Partial<Block>
+  ): Block {
     this.pushHistory(false);
     const clampedIndex = Math.max(0, Math.min(index, this.doc.blocks.length));
-    const block = createBlock(type, html);
+    const block = createBlock(type, html, undefined, extra);
     this.doc.blocks.splice(clampedIndex, 0, block);
     this.totalWords += block.wordCount;
     this.totalChars += block.charCount;
@@ -485,32 +670,29 @@ export function createWelcomeDocument(): DocumentModel {
         'paragraph',
         'An ultra-fast, local-first writing environment engineered for <strong>sub-16ms input latency</strong>, instant startup, and locked 60–120fps scrolling even across 100-page manuscripts.'
       ),
-      createBlock('heading2', 'Instant Formatting & Keyboard Flow'),
+      createBlock('heading2', 'Instant Formatting & Slash Commands'),
       createBlock(
         'paragraph',
-        'Everything stays out of your way until you need it. Highlight any text to summon the floating contextual toolbar, type <code>/</code> on any line for the slash command menu, or press <code>Cmd/Ctrl+K</code> to open the Command Palette.'
+        'Everything stays out of your way until you need it. Highlight text for the floating toolbar, press <code>/</code> for blocks (checklists, tables, callouts, toggles, images), <code>Ctrl/Cmd+F</code> to Find &amp; Replace, or <code>Ctrl/Cmd+K</code> for the Command Palette.'
       ),
-      createBlock('bullet-list', 'Type <code># </code>, <code>## </code>, or <code>### </code> at the start of a line for headings.'),
-      createBlock('bullet-list', 'Type <code>- </code> for bullet lists, <code>1. </code> for numbered lists, or <code>&gt; </code> for blockquotes.'),
-      createBlock('bullet-list', 'Type <code>```</code> for a syntax-clean code block, or <code>---</code> for a section divider.'),
-      createBlock('bullet-list', 'Use <code>Cmd/Ctrl+B</code>, <code>Cmd/Ctrl+I</code>, and <code>Cmd/Ctrl+U</code> for instant inline formatting.'),
+      createBlock('todo', 'Type <code>[] </code> or <code>/todo</code> for interactive checklists', undefined, { checked: true }),
+      createBlock('todo', 'Paste or drop any image onto the canvas to store it locally in IndexedDB', undefined, { checked: false }),
+      createBlock('callout', 'Everything is saved locally in IndexedDB during idle frames, and you can open or save <code>.md</code> / <code>.json</code> files directly on disk with <code>Ctrl/Cmd+O</code> and <code>Ctrl/Cmd+S</code>.'),
       createBlock('heading2', 'Why It Feels Instant'),
       createBlock(
         'blockquote',
         'Speed is not a benchmark number—it is the absence of friction between thought and ink.'
       ),
       createBlock(
-        'paragraph',
-        'VeloWrite maintains a <mark>windowed virtual DOM</mark> backed by a prefix-sum height cache and O(1) incremental word counting. Only the visible viewport plus a small overscan buffer is mounted at any moment, keeping DOM node count constant whether you are writing a one-page memo or a 100-page book.'
-      ),
-      createBlock(
         'code-block',
-        `// Zero-latency optimistic persistence\nconst latencyMs = performance.now() - inputStart;\nstorage.scheduleAutosave(store.getDocument()); // idle-frame IndexedDB commit`
+        `// Zero-latency optimistic persistence\nconst latencyMs = performance.now() - inputStart;\nstorage.scheduleAutosave(store.getDocument()); // idle-frame IndexedDB commit`,
+        undefined,
+        { codeLang: 'typescript' }
       ),
       createBlock('heading2', 'Try the 100-Page Stress Test'),
       createBlock(
         'paragraph',
-        'Open the Command Palette with <code>Cmd/Ctrl+K</code> and select <strong>Generate 100-Page Benchmark Document</strong> to experience locked 60–120fps scrolling and typing on a ~50,000-word manuscript, or export your work cleanly to <strong>Markdown</strong>, <strong>DOCX</strong>, or <strong>JSON</strong>.'
+        'Open the Command Palette with <code>Ctrl/Cmd+K</code> and select <strong>Generate 100-Page Benchmark Document</strong> to experience locked 60–120fps scrolling on a ~50,000-word manuscript, or export cleanly to <strong>PDF</strong>, <strong>Markdown</strong>, <strong>DOCX</strong>, or <strong>JSON</strong>.'
       ),
       createBlock('divider', ''),
       createBlock('paragraph', 'Start typing below, or press / to insert a new block…'),
@@ -524,7 +706,7 @@ export function generateBenchmarkDocument(): DocumentModel {
     createBlock('heading1', '100-Page Performance Benchmark Manuscript'),
     createBlock(
       'paragraph',
-      'This generated document contains <strong>~1,500 blocks and ~50,000 words</strong> (~100 paginated pages). Scroll rapidly, jump via the Outline sidebar, and type anywhere to verify locked 60–120fps rendering and sub-16ms input latency.'
+      'This generated document contains <strong>~1,500 blocks and ~50,000 words</strong> (~100 paginated pages). Scroll rapidly, jump via the Outline sidebar, search with Ctrl/Cmd+F, and type anywhere to verify locked 60–120fps rendering.'
     ),
   ];
 
@@ -571,7 +753,9 @@ export function generateBenchmarkDocument(): DocumentModel {
         blocks.push(
           createBlock(
             'code-block',
-            `// Benchmark section ${ch}.${sec}\nexport function findFirstVisible(offsets: Float64Array, scrollTop: number): number {\n  let lo = 0, hi = offsets.length - 1;\n  while (lo < hi) { const mid = (lo + hi) >>> 1; if (offsets[mid] < scrollTop) lo = mid + 1; else hi = mid; }\n  return lo;\n}`
+            `// Benchmark section ${ch}.${sec}\nexport function findFirstVisible(offsets: Float64Array, scrollTop: number): number {\n  let lo = 0, hi = offsets.length - 1;\n  while (lo < hi) { const mid = (lo + hi) >>> 1; if (offsets[mid] < scrollTop) lo = mid + 1; else hi = mid; }\n  return lo;\n}`,
+            undefined,
+            { codeLang: 'typescript' }
           )
         );
       }

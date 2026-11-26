@@ -18,6 +18,24 @@ export interface VeloWriteDesktopBridge {
   getAppInfo: () => Promise<DesktopAppInfo>;
   checkForUpdates: () => Promise<{ ok: boolean; packaged?: boolean; error?: string }>;
   installUpdate: () => Promise<void>;
+  openFile: () => Promise<{ filePath: string; fileName: string; content: string } | null>;
+  saveFile: (payload: {
+    filePath?: string | null;
+    defaultName: string;
+    markdownContent: string;
+    jsonContent: string;
+  }) => Promise<{ canceled: boolean; filePath?: string; fileName?: string }>;
+  exportPdf: (payload: {
+    defaultName: string;
+    pageSize: 'letter' | 'a4';
+  }) => Promise<{ canceled: boolean; filePath?: string }>;
+  chooseSyncFolder: () => Promise<string | null>;
+  syncWriteDoc: (payload: {
+    folderPath: string;
+    docId: string;
+    json: string;
+  }) => Promise<boolean>;
+  syncReadAll: (payload: { folderPath: string }) => Promise<string[]>;
   onUpdateStatus: (cb: (event: UpdateStatusEvent) => void) => () => void;
 }
 
